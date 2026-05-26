@@ -8,9 +8,36 @@
 
 ## Rename Policy
 
-**Step 2a: Prefix decision (MUST do first)**
+**Step 2a: Class/prefix decision (MUST do first)**
 
-Before choosing any function name, determine the module prefix. Check these signals (need at least 2 to apply a prefix):
+Before choosing any function name, determine whether it belongs to a C++ class (use `Class__Method` with double underscore) or a module (use `Module__Function`). Check these signals in priority order:
+
+### Priority 1: Vtable membership (strongest signal)
+
+Check if the function's address appears in a known vtable. Use `inspect_memory_content` on known vtable addresses to read the function pointer slots, or check if the function is called via an indirect `CALL dword ptr [EAX + N]` where EAX was loaded from `*(this + 0)`.
+
+**If the function is in a vtable**: name it `ClassName__vmethod_N` (or a descriptive name if the method's purpose is clear), where `ClassName` comes from the vtable's RTTI or the constructor that writes it.
+
+Two RTTI systems exist in WAR.exe:
+- **MSVC RTTI**: search for `.?AV<ClassName>@@` strings near the vtable address. Works for all C++ classes with virtual functions.
+- **Gamebryo NiRTTI**: for `Ni*` classes, vtable slot 0 is `GetRTTI()` returning a static `NiRTTI` struct (`{pcName, pkBaseRTTI}`). The `pcName` field is the authoritative class name (plain ASCII, e.g. `"NiNode"`). Search for the bare class name string and follow its DATA xrefs to find the NiRTTI struct. See core.md for the struct layout and walkable parent chain.
+
+### Priority 2: `this` pointer / field offsets (strong signal)
+
+If the function operates on `this` (ECX in `__thiscall`, or EAX/EDI-implicit), check what field offsets it accesses. Different classes own different offset ranges:
+
+| Class | Ctor | Vtable | TypeId | Distinctive fields |
+|---|---|---|---|---|
+| `GameObject` | 0x00431a31 | 0x00A76FD4 | — | +0x00..+0xDC (base fields) |
+| `MonsterObject` | 0x00432257 | 0x00A7703C | 3 | +0xFC/+0x17C (equipment arrays), +0x268 (mesh refs), +0x3be..+0x3dc (obf weapon cache) |
+| `PlayerObject` | 0x00432ad8 | (inherits Monster) | 2 | extends MonsterObject |
+| `StaticObject` | 0x00432f5a | — | 1 | — |
+
+If the function reads/writes fields ONLY in the +0x00..+0xDC range → `GameObject__`. If it touches +0xFC/+0x17C/+0x268 → `MonsterObject__`. Inheritance applies: `PlayerObject` extends `MonsterObject`.
+
+### Priority 3: Caller context / module signals (medium signal)
+
+Check these signals (need at least 2 to apply a prefix):
 
 1. **Source/path hint** -- plate comment `Source:` line, string references pointing to a .cpp file
 2. **Core behavior domain** -- function clearly belongs to one system (pathfinding, data tables, skills, etc.)
@@ -18,6 +45,10 @@ Before choosing any function name, determine the module prefix. Check these sign
 
 If 2+ signals match a known prefix from the Known Module Prefixes table: the name **must** include that prefix.
 If signals are mixed or weak: no prefix.
+
+### Critical: Do NOT invent class names
+
+Only use class names that exist in WAR.exe's C++ codebase (confirmed via RTTI strings, constructors, or vtables). Do not create synthetic grouping prefixes like `EquipmentVisual__` or `StringHelper__` — if no real class owns the function, use a module/subsystem prefix (`Entity__`, `Network__`) or no prefix at all. Check RTTI: search for `.?AV<Name>@@` in Ghidra strings before using any class name.
 
 **Step 2b: Choose the full name (prefix + PascalCase verb)**
 

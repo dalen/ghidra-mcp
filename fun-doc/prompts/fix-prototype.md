@@ -14,6 +14,10 @@
    - Return type: what does EAX hold at each RET? void, int, pointer, bool?
    - Parameter types: how are stack/register params used?
    - Calling convention: __stdcall, __cdecl, __fastcall, __thiscall
+   - **Class membership**: if `__thiscall` or implicit-register `this`, check
+     whether the function's address appears in a known vtable (see core.md
+     "Known C++ Class Hierarchy"). This determines the correct class prefix
+     if the function also needs renaming.
 2. **Set prototype**: `set_function_prototype(function_address=..., prototype=...)`
    - The address parameter is named `function_address` (not `address`), and the
      prototype string parameter is named `prototype`.
