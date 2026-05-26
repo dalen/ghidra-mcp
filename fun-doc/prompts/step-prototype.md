@@ -21,7 +21,7 @@ If signals are mixed or weak: no prefix.
 
 **Step 2b: Choose the full name (prefix + PascalCase verb)**
 
-1. Combine the prefix decision with a descriptive PascalCase name: `DATATBLS_FreeResourceBuffer`, `PATH_FindNearestPosition`
+1. Combine the prefix decision with a descriptive PascalCase name: `DataCollection__LoadFromBlobWar.exe`, `WarStateManager__AddState`
 2. If no rename is needed (current name already has correct prefix + accurate description): **SKIP** `rename_function_by_address`.
 3. If the name needs changing: call `rename_function_by_address` with the complete prefixed name.
 
@@ -29,16 +29,16 @@ Call rename + prototype in parallel **only when rename is actually needed**. If 
 
 ## Naming Rules
 
-PascalCase, verb-first. Module prefixes (`UPPERCASE_`) are allowed and match original source conventions.
+PascalCase, verb-first. Module prefixes (`AbilityLib__`) are allowed.
 
 Valid patterns:
 - `GetPlayerHealth`, `ProcessInputEvent`, `ValidateItemSlot` (plain PascalCase)
-- `DATATBLS_CompileTxtDataTable`, `TREASURE_GenerateLoot`, `SKILLS_GetLevel` (with module prefix)
+- `AbilityLib__GetAbilityCastTime`, `OldWorldArmoryData__LoadCsv`, `DataCollection__GetByIndex` (with module prefix)
 
 Invalid patterns:
 - `processData` -> `ProcessData` (must be PascalCase)
 - `doStuff` -> descriptive name based on actual behavior
-- `DATATBLS_compileTable` -> `DATATBLS_CompileTable` (part after prefix must be PascalCase)
+- `AbilityLib__getAbilityCastTime` -> `AbilityLib__GetAbilityCastTime` (part after prefix must be PascalCase)
 
 ## Verb Specificity Tier (HARD-ENFORCED)
 
@@ -66,7 +66,7 @@ Invalid patterns:
 | `HandleNetworkInput` | ✅ pass | Tier 3 + 2 specifiers |
 | `CalculateDamage` | ✅ pass | Tier 1 + 1 specifier |
 | `Process` | ❌ reject | Tier 3 + 0 specifiers (no tokens at all) |
-| `DATATBLS_CompileTxtDataTable` | ✅ pass | Tier 1 (Compile) + 3 specifiers — prefix doesn't change tier rules |
+| `AbilityLib__GetAbilityCastTime` | ✅ pass | Tier 1 (Compile) + 3 specifiers — prefix doesn't change tier rules |
 
 If your candidate name fails: replace the vague verb with a more specific one OR add concrete specifiers describing what the function operates on.
 

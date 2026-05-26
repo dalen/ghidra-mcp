@@ -6,7 +6,7 @@ four-axis bar defined in `step-globals.md` (loaded separately).
 
 ## Context you've been given
 
-- **Program**: the Ghidra program path (e.g. `/Vanilla/1.13d/D2Common.dll`)
+- **Program**: the Ghidra program path (e.g. `/WAR.exe`)
 - **Address**: the global's address (e.g. `0x6fdc1234`)
 - **Audit (before)**: the JSON output of `audit_global` for this address.
   It contains the current `name`, `type`, `length`, `plate_comment`,
@@ -107,7 +107,7 @@ If you see one of these errors, do **not** retry with a different format
 
 Addresses are bare hex (`0x6fdc1234`) or optionally `ram:0xNNNN` for the
 default address space. **Never** prefix with the binary name —
-`fog.dll:0x6ff82f34`, `D2Game.dll:0x6fc12000`, etc. produce
+`fog.dll:0x6ff82f34`, `WAR.exe:0x6fc12000`, etc. produce
 `Unknown address space 'fog.dll'` and waste a tool call. The binary is
 identified by the **`program=` parameter**, not the address prefix.
 
@@ -136,7 +136,7 @@ address:
 |---|---|---|
 | `get_plate_comment` | Function-only — returns "No function at address" for data. | The plate is already in the audit's `plate_comment` field. |
 | `force_decompile` | Decompiles functions, not data. Returns "No function found at address". | `analyze_data_region` for data layout; decompile a *caller* if you need usage context. |
-| `decompile_function(global_addr)` | Same — addresses targeting data globals are not function entries. | Decompile one of the global's xref *callers* instead. |
+| `decompile_function(address)` | Same — addresses targeting data globals are not function entries. | Decompile one of the global's xref *callers* instead. |
 | `set_plate_comment` | Function-only. Use `batch_set_comments(program=..., address=..., plate_comment=...)` for data. | See fallback writers table above. |
 | `analyze_function_complete` | Function-only scoring. | Globals are scored via `audit_global`. |
 

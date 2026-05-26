@@ -85,6 +85,8 @@ from collections import defaultdict
 from datetime import datetime, date, timezone
 from pathlib import Path
 
+ignore_list = ["Collision__QueryBVHByFrustum", "NiPSysObject_SetFloatValue", "FUN_0076e090", "FUN_00796bf0"]
+
 # Force UTF-8 on stdout/stderr so printing Unicode from LLM responses
 # (smart quotes, em-dashes, non-ASCII identifiers) doesn't crash worker
 # threads with 'charmap' codec errors on Windows legacy consoles. A crashed
@@ -807,7 +809,7 @@ _ghidra_launch_attempted = False
 _ghidra_launch_lock = threading.Lock()
 
 
-def check_ghidra_online(timeout=3):
+def check_ghidra_online(timeout=30):
     """Return True if the Ghidra HTTP server is reachable."""
     try:
         r = requests.get(f"{GHIDRA_URL}/mcp/schema", timeout=timeout)
@@ -827,6 +829,8 @@ def try_launch_ghidra():
         if _ghidra_launch_attempted:
             return False
         _ghidra_launch_attempted = True
+    
+    return True
 
     candidates = []
     env_dir = os.environ.get("GHIDRA_INSTALL_DIR") or os.environ.get("GHIDRA_HOME")
@@ -2555,6 +2559,9 @@ def compute_priority(func):
     if score >= 90:
         return 0
 
+    if func.get("name", "") in ignore_list:
+        return 0
+
     caller_count = func.get("caller_count", 0)
     is_leaf = func.get("is_leaf", False)
     fixable = func.get("fixable", 0)
@@ -2928,6 +2935,8 @@ def select_candidates(funcs, queue=None, active_binary=None, with_scoring_lane=N
     candidates = []
     for key, func in funcs.items():
         if func.get("is_thunk") or func.get("is_external"):
+            continue
+        if func.get("name", "") in ignore_list:
             continue
         is_pinned = key in pinned
         if active_binary and func.get("program_name") != active_binary:

@@ -72,7 +72,6 @@ Structure Layout: (if accessing structs)
 
 **REQUIRED sections**: Summary (first line), Source, Parameters, Returns. These must ALWAYS be present.
 **Conditional sections**: Algorithm (if >3 steps), Special Cases (if any), Structure Layout (if struct accesses).
-**Source line**: Derive from module prefix (e.g., ROOM_ → DrlgRoom.cpp, PATH_ → Path.cpp). If unknown, use `Source: Unknown`.
 
 ### Inline Comments
 

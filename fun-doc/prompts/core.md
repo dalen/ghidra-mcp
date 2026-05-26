@@ -1,3 +1,7 @@
+# Context
+
+You are reverse engineering the Warhammer Online: Return of Reckoning game client.
+
 # Function Documentation Core Rules
 
 Apply all changes directly in Ghidra via MCP tools. Do not create or edit filesystem files.

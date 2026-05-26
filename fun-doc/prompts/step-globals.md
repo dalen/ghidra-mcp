@@ -121,7 +121,7 @@ This is the same "underclaim with placeholder" convention used for variables —
 ## Plate-comment format (Win32-derived template)
 
 The community-standard structure (Microsoft Win32 function-header
-template adapted for globals; ReactOS, Wine, and D2MOO all converge on
+template adapted for globals; ReactOS and Wine all converge on
 this shape):
 
 ```
@@ -218,7 +218,7 @@ Set by:
 Read by:
   SNetCreateLadderGame, BroadcastGameStateToPlayers,
   ProcessEntityStateChangeEvents, RetrieveDataByTypeWithBuffer,
-  NET_ShutdownGameAndCleanupResources
+  Network_ShutdownGameAndCleanupResources
 ```
 
 Note the section headers (`Set by:`, `Read by:`) sit alone on their

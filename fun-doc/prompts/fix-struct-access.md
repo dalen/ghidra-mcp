@@ -18,7 +18,6 @@
 
 1. Check if the base pointer variable is already typed as a known struct -- `get_struct_layout`
 2. Search for existing structs with compatible offsets -- `search_data_types` with a likely name
-3. Check common D2 structs that match the offset pattern (UnitAny, Room, DrlgRoom, ItemData, etc.)
 
 **Only create a new struct if:**
 - No existing struct covers the accessed offsets, AND
@@ -34,7 +33,7 @@
 1. **Identify the base pointer** -- which variable is being dereferenced? What's its current type?
 2. **Check existing structs** (reuse-first):
    - `get_struct_layout(struct_name)` if the variable is already typed as a struct pointer
-   - `search_data_types(name_pattern)` to find structs with matching names or known patterns
+   - `search_data_types(pattern)` to find structs with matching names or known patterns
    - If a compatible struct exists: apply it via `set_local_variable_type(var, "ExistingStruct *")`
 3. **Create new struct only if gate conditions are met**:
    - Fields must be a JSON array:
