@@ -179,7 +179,29 @@ neighbors to infer the subsystem.
 
 **Prefer underclaiming over guessing.** A correct neutral name is always better than a confident wrong name.
 
+### Purpose over Mechanism (functions)
+
+A function's name should describe its **role to callers**, not the instruction
+sequence in its body. The body is what you read in the plate comment; the name
+is the one-token answer to "what would the caller's author write in the comment
+above the call site?"
+
+| Smell | Why it's wrong | Better |
+|---|---|---|
+| Chained verbs (`CopyToClear…`, `InitAndPrepare…`, `…AndDispatch…`) | Two verbs = describing two body steps, not one purpose | Pick the single verb that names the role: `Reset`, `Initialize`, `Dispatch` |
+| Phase suffix (`…Prolog`, `…Setup`, `…Phase1`) used to distinguish from a sibling | Often the sibling and this fn have *different purposes*, not different phases of one | Re-examine: does each sibling have its own role-verb? |
+| Body-summary names (`CopyToClearDataProlog`, `LoopAndCleanupEntries`) | Reads as a function-body summary, not a role | If you can't pick one verb, the name isn't ready — use placeholder `<Class>__Func<addr>` |
+| Mechanism-stacked nouns to pass the tier check (e.g. adding `Data`/`State`/`Buffer` filler) | Tokens added to satisfy the validator, not to convey role | Find the missing specifier from caller context, or use a placeholder |
+
+**Rule of thumb**: if your candidate name reads like a sentence describing what
+the function *does* (verb + verb + noun + qualifier), it's mechanism. If it
+reads like a label for what the function *is for* (one verb + the thing acted
+on), it's purpose. Purpose wins.
+
+### Justification for every renamed item
+
 Every renamed variable, struct field, or function must be justified by one of:
+- **Caller role evidence** (functions only): at least one caller's use of the return value or side-effect makes the role obvious
 - **Direct read/write behavior** in the decompiled code
 - **Control-flow role** (loop counter, branch condition, return value)
 - **Comparison against known constants** (type IDs, flags, sentinel values)

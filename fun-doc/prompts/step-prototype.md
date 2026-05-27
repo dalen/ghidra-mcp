@@ -8,9 +8,27 @@
 
 ## Rename Policy
 
-**Step 2a: Class/prefix decision (MUST do first)**
+**Step 2a (Priority 0): Caller-role skim — do this FIRST**
 
-Before choosing any function name, determine whether it belongs to a C++ class (use `Class__Method` with double underscore) or a module (use `Module__Function`). Check these signals in priority order:
+Before deciding prefix or verb, read 1–2 callers (`get_function_callers` then
+`decompile_function` on the top caller). Ask: *"What would the caller's author
+write in a comment above this call site?"* That sentence is the function's
+purpose — and the name should compress that purpose to one verb + the thing
+acted on.
+
+If callers reveal a clear role (`bundle.Reset()` before reuse, `Initialize`
+during startup, `Dispatch` to a handler table) — use that verb. If callers
+are ambiguous or unavailable, fall back to placeholder
+(`<Class>__Func<addr>`) rather than inventing a body-summary name from the
+inside.
+
+This is the single biggest defense against mechanism-stacked names like
+`CopyToClearDataProlog` — which arise when the worker only looks at the
+function's body and concatenates what it sees.
+
+**Step 2b: Class/prefix decision**
+
+Determine whether the function belongs to a C++ class (use `Class__Method` with double underscore) or a module (use `Module__Function`). Check these signals in priority order:
 
 ### Priority 1: Vtable membership (strongest signal)
 
@@ -50,10 +68,13 @@ If signals are mixed or weak: no prefix.
 
 Only use class names that exist in WAR.exe's C++ codebase (confirmed via RTTI strings, constructors, or vtables). Do not create synthetic grouping prefixes like `EquipmentVisual__` or `StringHelper__` — if no real class owns the function, use a module/subsystem prefix (`Entity__`, `Network__`) or no prefix at all. Check RTTI: search for `.?AV<Name>@@` in Ghidra strings before using any class name.
 
-**Step 2b: Choose the full name (prefix + PascalCase verb)**
+**Step 2c: Choose the full name (prefix + PascalCase role-verb)**
 
-1. Combine the prefix decision with a descriptive PascalCase name: `DataCollection__LoadFromBlobWar.exe`, `WarStateManager__AddState`
-2. If no rename is needed (current name already has correct prefix + accurate description): **SKIP** `rename_function_by_address`.
+1. Combine the prefix decision with a **role-based** PascalCase name (the verb
+   from Step 2a's caller-role skim): `DataCollection__LoadFromBlob`,
+   `WarStateManager__AddState`. The name should describe the function's *role
+   to callers*, not summarise its body — see core.md "Purpose over Mechanism".
+2. If no rename is needed (current name already has correct prefix + accurate role): **SKIP** `rename_function_by_address`.
 3. If the name needs changing: call `rename_function_by_address` with the complete prefixed name.
 
 Call rename + prototype in parallel **only when rename is actually needed**. If later tool calls in the same pass need to re-query the function, use its address instead of assuming the new name is available immediately. If rename is skipped, call only `set_function_prototype`.
@@ -101,6 +122,26 @@ Invalid patterns:
 
 If your candidate name fails: replace the vague verb with a more specific one OR add concrete specifiers describing what the function operates on.
 
+## Chained-Verb Smell (purpose-first, soft rule)
+
+A name containing two action verbs joined by `To`, `And`, or back-to-back
+(e.g. `CopyToClear…`, `InitAnd…`, `…ToDispatch…`) is almost always a
+body-summary, not a role. The tier validator may accept it, but it fails the
+intent of the naming system.
+
+| Candidate | Smell | Fix |
+|---|---|---|
+| `CopyToClearDataProlog` | Two verbs + phase suffix; describes the body in three pieces | `Reset` / `ResetForReuse` if callers use it before reuse |
+| `InitAndPrepareForUse` | Two verbs, redundant goal | `Initialize` (one verb covers it) |
+| `ProcessAndDispatchData` | Two verbs, weak-noun specifier | `Dispatch<Concrete>` if dispatch is the role |
+| `CheckAndCleanupResources` | Two verbs to dodge tier-3 weakness | `ReleaseResources` if release is the role |
+| `LoadFromBlobAndApply` | Two verbs, the "And" is a body step | `LoadFromBlob` (the apply step is body-internal) |
+
+If you genuinely cannot collapse to one verb, that is a signal you haven't
+found the role yet — prefer a placeholder (`<Class>__Func<addr>`) and
+document the body in the plate comment. Don't ship mechanism-stacked names
+to satisfy the tier validator.
+
 ## No Token-Subset Duplicates (HARD-ENFORCED)
 
 `rename_function_by_address` will REJECT a name that is a strict token-subset (or superset) of another already-named function in the same program — same module-prefix scope. Examples:
@@ -112,7 +153,17 @@ If your candidate name fails: replace the vague verb with a more specific one OR
 | `GetItemPrice` | `GetItemValue` | ✅ pass (different last token, neither subset) |
 | `ProcessNetworkPacket` | `ProcessLocalPacket` | ✅ pass (Network ≠ Local) |
 
-If the rejection error includes a `conflicts_with` field, do not just suffix `_2` or `New` — add a meaningful distinguisher that captures *why* this function differs from the conflicting one (e.g., `Broadcast`, `Local`, `ByIndex`, `ForPlayer`, `WithRetry`). The rejection's `suggestion` field gives concrete alternatives.
+If the rejection error includes a `conflicts_with` field, **first ask whether the
+two functions actually share a purpose**. If they do (e.g. two variants of the
+same send path), add a meaningful distinguisher capturing *why* they differ —
+`Broadcast`, `Local`, `ByIndex`, `ForPlayer`, `WithRetry`. If they don't share
+a purpose (the conflict is incidental — one is a real `SendStateUpdate` and
+yours is actually a `BuildStateUpdatePayload`), pick a different verb root
+entirely. Do **not** stack a `Prolog`/`Phase1`/`Internal` suffix to dodge the
+collision — that almost always means the verb root was wrong to begin with.
+
+Never suffix `_2` or `New`. The rejection's `suggestion` field gives concrete
+alternatives.
 
 ## Handling a Rejection Round-Trip
 
