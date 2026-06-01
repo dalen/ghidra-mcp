@@ -92,6 +92,7 @@ ignore_list = [
     "FUN_00796bf0", 
     "FUN_00755150",
     "FUN_005fe72b",
+    "FUN_00a3a340",
 ]
 
 # Force UTF-8 on stdout/stderr so printing Unicode from LLM responses
