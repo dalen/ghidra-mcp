@@ -37,7 +37,7 @@ from typing import Any, Optional
 
 
 DEFAULT_SQLITE_PATH = Path(__file__).parent.parent / "state.db"
-SLOW_QUERY_THRESHOLD_MS = 100  # logger fires above this (see slow_query_log.py)
+SLOW_QUERY_THRESHOLD_MS = 1000  # logger fires above this (see slow_query_log.py)
 
 
 @dataclass(frozen=True)

@@ -85,15 +85,7 @@ from collections import defaultdict
 from datetime import datetime, date, timezone
 from pathlib import Path
 
-ignore_list = [
-    "Collision__QueryBVHByFrustum",
-    "NiPSysObject_SetFloatValue",
-    "FUN_0076e090", 
-    "FUN_00796bf0", 
-    "FUN_00755150",
-    "FUN_005fe72b",
-    "FUN_00a3a340",
-]
+ignore_list = []
 
 # Force UTF-8 on stdout/stderr so printing Unicode from LLM responses
 # (smart quotes, em-dashes, non-ASCII identifiers) doesn't crash worker
