@@ -85,7 +85,7 @@ from collections import defaultdict
 from datetime import datetime, date, timezone
 from pathlib import Path
 
-ignore_list = []
+ignore_list = ["MsvcStl__Tree_LookupKey_Isnil25"]
 
 # Force UTF-8 on stdout/stderr so printing Unicode from LLM responses
 # (smart quotes, em-dashes, non-ASCII identifiers) doesn't crash worker
