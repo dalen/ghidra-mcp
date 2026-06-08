@@ -797,6 +797,11 @@ def dispatch_post(
 
     data = _normalize_post_payload(endpoint, data)
     timeout = get_timeout(endpoint, data)
+    # POST endpoints are non-idempotent (rename/create/set/delete/batch writes). Unlike GET,
+    # they must NOT be blindly retried: if the request reached the server it may have already
+    # applied the write, so resending after a 5xx or a mid-flight drop risks double-applying.
+    # The only safe retry is re-establishing a connection that failed before the request was
+    # sent — attempted once on the first iteration. Everything else surfaces as an error.
     for attempt in range(retries):
         try:
             text, status = do_request(
@@ -804,22 +809,15 @@ def dispatch_post(
             )
             if status == 200:
                 return text.strip()
-            if status >= 500 and attempt < retries - 1:
-                time.sleep(1)
-                continue
+            # Request reached the server (got an HTTP status) — do not retry a write.
             return json.dumps({"error": f"HTTP {status}: {text.strip()}"})
         except (ConnectionError, OSError) as e:
-            # Connection lost — try reconnect once, then retry
+            # Pre-send connection failure: re-establish once and retry. A drop after the
+            # request was sent is indistinguishable here, so we only ever try this once.
             if attempt == 0 and _try_reconnect():
-                continue
-            if attempt < retries - 1:
-                time.sleep(1)
                 continue
             return json.dumps({"error": str(e)})
         except Exception as e:
-            if attempt < retries - 1:
-                time.sleep(1)
-                continue
             return json.dumps({"error": str(e)})
 
     return json.dumps({"error": "Max retries exceeded"})
@@ -1122,8 +1120,12 @@ def register_tools_from_schema(
     for name in _dynamic_tool_names:
         try:
             mcp._tool_manager._tools.pop(name, None)
-        except Exception:
-            pass
+        except Exception as e:
+            # Reaches into FastMCP internals; if its private structure changes this
+            # would silently leak tools across reloads. Log so the breakage is visible.
+            logger.warning(
+                "Failed to unregister dynamic tool %r via mcp._tool_manager._tools "
+                "(FastMCP internals may have changed): %s", name, e)
     _dynamic_tool_names.clear()
     _loaded_groups.clear()
 
@@ -1186,8 +1188,11 @@ def _unload_group(group_name: str) -> int:
         try:
             mcp._tool_manager._tools.pop(name, None)
             _dynamic_tool_names.remove(name)
-        except Exception:
-            pass
+        except Exception as e:
+            # See unregister note above: FastMCP-internals access, log on failure.
+            logger.warning(
+                "Failed to unload tool %r via mcp._tool_manager._tools "
+                "(FastMCP internals may have changed): %s", name, e)
 
     if to_remove:
         _loaded_groups.discard(group_name)

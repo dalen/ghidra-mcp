@@ -390,14 +390,30 @@ def _short_jsonish(value, limit=1000):
     return text[:limit] + ("..." if len(text) > limit else "")
 
 
-def _log_ghidra_http_event(entry):
-    """Persist detailed Ghidra HTTP diagnostics without cluttering stdout.
+def _http_log_verbose():
+    return os.environ.get("FUN_DOC_HTTP_LOG_VERBOSE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
-    Routed through log_rotation.write_jsonl_rotating so the file is
-    bounded — pre-rotation this log grew unbounded at ~50 MB/day and
-    hit 1+ GB on long-running workspaces.
+
+def _log_ghidra_http_event(entry):
+    """Persist Ghidra HTTP diagnostics without cluttering stdout.
+
+    Routed through log_rotation.write_jsonl_rotating so the file is bounded
+    (pre-rotation it grew unbounded at ~50 MB/day and hit 1+ GB).
+
+    Successful calls (ok=True) are the overwhelming bulk of this log and are
+    rarely useful after the fact — the diagnostic value (e.g. the 2026-04-24
+    bridge deadlock) lives in errors/timeouts/offline events, which are always
+    kept. Skip ok=True events by default to keep the series small; set
+    FUN_DOC_HTTP_LOG_VERBOSE=1 to record every call (e.g. for latency analysis).
     """
     from log_rotation import write_jsonl_rotating
+
+    if entry.get("ok") and not _http_log_verbose():
+        return
 
     try:
         line = json.dumps(entry, default=str)
@@ -4654,14 +4670,20 @@ def _wrap_result(result):
 
 
 def _provider_timeout_seconds(provider, complexity_tier=None):
+    # Base 300s (was 900s): a hung/slow provider call previously tied up a worker for
+    # 15-25 min, which surfaced as the bridge_counter_stall "workers active, no progress"
+    # pattern. 5 min is ample for a normal documentation pass; genuinely large functions
+    # still get the extra budget below (complex +300 -> 600s, massive +600 -> 900s).
+    # Override per-provider via FUNDOC_<PROVIDER>_TIMEOUT_SECS or globally via
+    # FUNDOC_PROVIDER_TIMEOUT_SECS.
     env_key = f"FUNDOC_{str(provider or AI_PROVIDER).upper()}_TIMEOUT_SECS"
     raw_timeout = os.environ.get(env_key) or os.environ.get(
-        "FUNDOC_PROVIDER_TIMEOUT_SECS", "900"
+        "FUNDOC_PROVIDER_TIMEOUT_SECS", "300"
     )
     try:
         timeout_secs = max(60, int(raw_timeout))
     except (TypeError, ValueError):
-        timeout_secs = 900
+        timeout_secs = 300
 
     if complexity_tier == "massive":
         timeout_secs += 600
@@ -7119,29 +7141,26 @@ def process_function(
                     "  Ghidra did not come online within 120s. Skipping function.",
                     flush=True,
                 )
-                func["last_result"] = "ghidra_offline"
-                func["last_processed"] = datetime.now().isoformat()
-                update_function_state(func_key, func)
+                # Environmental failure, not the function's fault — do NOT park it
+                # (no sticky last_result/last_processed) so the selector re-picks it
+                # once Ghidra recovers. Return the distinct "ghidra_offline" result so
+                # the worker loop backs off and waits instead of churning the queue.
                 bus_emit(
                     "function_complete",
                     {"key": func_key, "result": "ghidra_offline", "score": None},
                 )
                 return _finish(
-                    "failed",
-                    logged_result="ghidra_offline",
+                    "ghidra_offline",
                     reason="Ghidra did not come online within 120s",
                 )
         else:
-            func["last_result"] = "ghidra_offline"
-            func["last_processed"] = datetime.now().isoformat()
-            update_function_state(func_key, func)
+            # Environmental failure — do NOT park (see note above); leave re-pickable.
             bus_emit(
                 "function_complete",
                 {"key": func_key, "result": "ghidra_offline", "score": None},
             )
             return _finish(
-                "failed",
-                logged_result="ghidra_offline",
+                "ghidra_offline",
                 reason=f"server not reachable at {GHIDRA_URL}",
             )
 
@@ -7191,12 +7210,11 @@ def process_function(
     # recovery_pass_done.
     if data.get("ghidra_offline"):
         print(
-            f"  GHIDRA OFFLINE — cannot fetch function data. Skipping until Ghidra is reachable.",
+            f"  GHIDRA OFFLINE — cannot fetch function data. Will retry when Ghidra is reachable.",
             flush=True,
         )
-        func["last_result"] = "ghidra_offline"
-        func["last_processed"] = datetime.now().isoformat()
-        update_function_state(func_key, func)
+        # Environmental failure — do NOT park (see note above); leave re-pickable so
+        # the function is retried automatically once Ghidra recovers.
         bus_emit(
             "function_complete",
             {
@@ -7206,8 +7224,7 @@ def process_function(
             },
         )
         return _finish(
-            "failed",
-            logged_result="ghidra_offline",
+            "ghidra_offline",
             score_after=live_score,
             reason="cannot fetch function data",
         )
@@ -8662,7 +8679,7 @@ def main():
         from event_bus import get_bus
 
         bus = get_bus()
-        app, socketio = create_app(STATE_FILE, event_bus=bus)
+        app, socketio = create_app(STATE_FILE, event_bus=bus, dashboard_port=args.web_port)
         dashboard_url = f"http://127.0.0.1:{args.web_port}"
         print(f"Starting web dashboard at {dashboard_url}", flush=True)
 
@@ -8729,7 +8746,7 @@ def main():
             from event_bus import get_bus
 
             bus = get_bus()
-            dash_app, dash_socketio = create_app(STATE_FILE, event_bus=bus)
+            dash_app, dash_socketio = create_app(STATE_FILE, event_bus=bus, dashboard_port=dash_port)
             dashboard_url = f"http://127.0.0.1:{dash_port}"
 
             # Run Flask-SocketIO in a daemon thread (auto-exits when main process exits)
@@ -8934,7 +8951,7 @@ def main():
                         session["functions"].append(key)
                     elif result == "skipped":
                         session["skipped"] += 1
-                    elif result == "failed" or result == "blocked":
+                    elif result in ("failed", "blocked", "ghidra_offline"):
                         session["failed"] += 1
                     elif result == "partial":
                         session["partial"] += 1
@@ -8957,7 +8974,7 @@ def main():
                         session["functions"].append(key)
                     elif result == "skipped":
                         session["skipped"] += 1
-                    elif result == "failed" or result == "blocked":
+                    elif result in ("failed", "blocked", "ghidra_offline"):
                         session["failed"] += 1
                     elif result == "partial":
                         session["partial"] += 1
@@ -9016,7 +9033,7 @@ def main():
                 session["functions"].append(key)
             elif result == "skipped":
                 session["skipped"] += 1
-            elif result == "failed" or result == "blocked":
+            elif result in ("failed", "blocked", "ghidra_offline"):
                 session["failed"] += 1
             elif result == "partial":
                 session["partial"] += 1

@@ -20,13 +20,13 @@
 >
 > If Ghidra MCP saves you time, consider [sponsoring the project](https://github.com/sponsors/bethington). One-time and recurring support both help fund compatibility updates, production hardening, docs, and new tooling.
 
-A production-ready Model Context Protocol (MCP) server that bridges Ghidra's powerful reverse engineering capabilities with modern AI tools and automation frameworks. **245 MCP tools**, battle-tested AI workflows, and the most comprehensive Ghidra-MCP integration available — now including P-code emulation, live debugger integration, and PCode-graph data flow analysis.
+A production-ready Model Context Protocol (MCP) server that bridges Ghidra's powerful reverse engineering capabilities with modern AI tools and automation frameworks. **248 MCP tools**, battle-tested AI workflows, and the most comprehensive Ghidra-MCP integration available — now including P-code emulation, live debugger integration, and PCode-graph data flow analysis.
 
 ## Why Ghidra MCP?
 
 Most Ghidra MCP implementations give you a handful of read-only tools and call it a day. This project is different — it was built by a reverse engineer who uses it daily on real binaries, not as a demo.
 
-- **245 MCP tools** — 3x more than any competing implementation. Not just read operations — full write access for renaming, typing, commenting, structure creation, script execution, P-code emulation, and live debugging.
+- **248 MCP tools** — 3x more than any competing implementation. Not just read operations — full write access for renaming, typing, commenting, structure creation, script execution, P-code emulation, and live debugging.
 - **Battle-tested AI workflows** — Proven documentation workflows (V5) refined across hundreds of functions. Includes step-by-step prompts, Hungarian notation reference, batch processing guides, and orphaned code discovery.
 - **Production-grade reliability** — Atomic transactions, batch operations (93% API call reduction), configurable timeouts, and graceful error handling. No silent failures.
 - **Cross-binary documentation transfer** — SHA-256 function hash matching propagates documentation across binary versions automatically. Document once, apply everywhere.
@@ -56,7 +56,7 @@ v5.0 moves conventions from "things to remember" into the tool layer, where they
 
 ### Core MCP Integration
 - **Full MCP Compatibility** — Complete implementation of Model Context Protocol
-- **245 MCP Tools** — Comprehensive API surface covering every aspect of binary analysis
+- **248 MCP Tools** — Comprehensive API surface covering every aspect of binary analysis
 - **Production-Ready Reliability** — Atomic transactions, batch operations, configurable timeouts
 - **Real-time Analysis** — Live integration with Ghidra's analysis engine
 
@@ -370,8 +370,8 @@ GhidraMCP is designed for **localhost-only development**. The default configurat
 | Env var | Effect |
 |---|---|
 | `GHIDRA_MCP_AUTH_TOKEN` | When set, every HTTP request must carry `Authorization: Bearer <token>`. Timing-safe comparison. `/mcp/health`, `/health`, `/check_connection` are exempt. |
-| `GHIDRA_MCP_ALLOW_SCRIPTS` | Set to `1`, `true`, or `yes` to enable `/run_script_inline` and `/run_ghidra_script`. **Off by default as of v5.4.1** — these endpoints execute arbitrary Java against the Ghidra process. |
-| `GHIDRA_MCP_FILE_ROOT` | When set to a directory path, filesystem-path endpoints (`/import_file`, `/open_project`, `/delete_file`, etc.) canonicalize the input and require it to fall under this root. Prevents path-traversal. |
+| `GHIDRA_MCP_ALLOW_SCRIPTS` | Set to `1`, `true`, or `yes` to enable `/run_script_inline` and `/run_ghidra_script`. **Off by default as of v5.4.1** — these endpoints execute arbitrary Java against the Ghidra process. In headless mode this also triggers OSGi `BundleHost` initialization at server startup (Felix framework, ~hundreds of ms); leave it off if you don't need script execution. |
+| `GHIDRA_MCP_FILE_ROOT` | When set to a directory path, filesystem-path endpoints (`/load_program`, `/import_file`, `/open_project`, `/delete_file`, etc.) canonicalize the input and require it to fall under this root. Prevents path-traversal. |
 
 Name-quality enforcement is separate from security. By default,
 `rename_function_by_address` and global write endpoints reject names that fail
@@ -508,7 +508,7 @@ python -m tools.setup install-ghidra-deps --ghidra-path "C:\ghidra_12.1_PUBLIC"
 
 ## 📊 Production Performance
 
-- **MCP Tools**: 245 tools fully implemented
+- **MCP Tools**: 248 tools fully implemented
 - **Speed**: Sub-second response for most operations
 - **Efficiency**: 93% reduction in API calls via batch operations
 - **Reliability**: Atomic transactions with all-or-nothing semantics
@@ -1011,7 +1011,7 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 | Metric | Value |
 |--------|-------|
 | **Version** | 5.12.0 |
-| **MCP Tools** | 245 fully implemented |
+| **MCP Tools** | 248 fully implemented |
 | **GUI Endpoints** | 196 (GhidraMCPPlugin) |
 | **Headless Endpoints** | 195 (GhidraMCPHeadlessServer) |
 | **Compilation** | ✅ 100% success |
