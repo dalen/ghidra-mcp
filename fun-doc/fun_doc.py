@@ -85,7 +85,22 @@ from collections import defaultdict
 from datetime import datetime, date, timezone
 from pathlib import Path
 
-ignore_list = ["MsvcStl__Tree_LookupKey_Isnil25"]
+ignore_list = [
+    "MsvcStl__Tree_LookupKey_Isnil25",
+    "FUN_00a743e3",
+    "FUN_00a74941",
+    "FUN_00b08236",
+    "MisanalyzedData_00b0b168",
+    "Thunk_Data_afe989",
+    "CorruptedData_00b0b480"
+    "InvalidData_00b0af40",
+    "BadData_00b0af40",
+    "FUN_00b0b434",
+    "FUN_004e8a51",
+    "FUN_00555741",
+    "NiParticleSystem__GetViewerStrings",
+    "RenderClass__OnWorldOriginChanged",
+]
 
 # Force UTF-8 on stdout/stderr so printing Unicode from LLM responses
 # (smart quotes, em-dashes, non-ASCII identifiers) doesn't crash worker
@@ -2575,6 +2590,9 @@ def compute_priority(func):
     if score >= 90:
         return 0
 
+    if func.get("name", "").startswith("BadData_"):
+        return 0
+
     if func.get("name", "") in ignore_list:
         return 0
 
@@ -2951,6 +2969,8 @@ def select_candidates(funcs, queue=None, active_binary=None, with_scoring_lane=N
     candidates = []
     for key, func in funcs.items():
         if func.get("is_thunk") or func.get("is_external"):
+            continue
+        if func.get("name", "").startswith("BadData_"):
             continue
         if func.get("name", "") in ignore_list:
             continue
@@ -4678,7 +4698,7 @@ def _provider_timeout_seconds(provider, complexity_tier=None):
     # FUNDOC_PROVIDER_TIMEOUT_SECS.
     env_key = f"FUNDOC_{str(provider or AI_PROVIDER).upper()}_TIMEOUT_SECS"
     raw_timeout = os.environ.get(env_key) or os.environ.get(
-        "FUNDOC_PROVIDER_TIMEOUT_SECS", "300"
+        "FUNDOC_PROVIDER_TIMEOUT_SECS", "900"
     )
     try:
         timeout_secs = max(60, int(raw_timeout))
