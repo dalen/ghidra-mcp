@@ -3262,26 +3262,76 @@ def refresh_candidate_scores(
             by_program_stats[prog] = {"refreshed": prog_refreshed, "stale": prog_stale}
 
     if save and refreshed > 0:
-        # Read-modify-write: re-read the latest state from disk before saving
-        # so we don't clobber functions that were added (e.g. by a concurrent
-        # state merge) between when this refresh started and now. Only the
-        # specific function entries we scored get overwritten.
         refreshed_funcs = {
             c["key"]: c["func"]
             for prog_items in by_prog.values()
             for c in prog_items
             if c["func"].get("score") is not None
         }
-        with _state_lock:
-            latest = load_state()
-            latest_funcs = latest.setdefault("functions", {})
+        repo = _get_storage_repo()
+        if repo is not None:
+            # SQL backend (the only runtime path). Persist each refreshed row
+            # surgically via update_function_fields — touching ONLY the columns
+            # refresh owns.
+            #
+            # Two bugs this avoids:
+            #   1. The pre-SQL code wrote _atomic_write_state(latest), i.e. the
+            #      now-dead state.json. load_state reads the SQL store, so the
+            #      whole refresh (re-scored values AND one-shot-flag clears)
+            #      silently never persisted. The persistence-layer swap (PR1 P5)
+            #      updated save_state but missed this direct call site.
+            #   2. A full save_state(latest) here would bulk-upsert every
+            #      function through _state_func_to_row, which derives
+            #      attempts/run_count from the inline list — and _row_to_state_func
+            #      loads that list as [] for cost reasons. That would reset
+            #      run_count + last_run_* to zero for the whole table. The
+            #      partial update sidesteps the accumulator columns entirely.
+            #
+            # One-shot flags are cleared with explicit falsy values, NOT by the
+            # func.pop() above: the merge-upsert leaves omitted columns intact,
+            # so a popped key would never clear the persisted flag. (The pops
+            # keep the in-memory dict tidy for the legacy fallback + callers.)
             for key, func in refreshed_funcs.items():
-                if key in latest_funcs:
-                    latest_funcs[key].update(func)
-                else:
-                    latest_funcs[key] = func
-            _atomic_write_state(latest)
-        bus_emit("state_changed")
+                pp = func.get("program")
+                addr = func.get("address")
+                if not pp or not addr:
+                    continue
+                repo.update_function_fields(
+                    pp,
+                    addr,
+                    score=func.get("score"),
+                    fixable=func.get("fixable"),
+                    has_custom_name=func.get("has_custom_name"),
+                    has_plate_comment=func.get("has_plate_comment"),
+                    is_leaf=func.get("is_leaf"),
+                    classification=func.get("classification"),
+                    deductions=func.get("deductions"),
+                    # one-shot flag clears (mirror the func.pop() resets above)
+                    decompile_timeout=False,
+                    decompile_timeout_at=None,
+                    not_a_function=False,
+                    not_a_function_at=None,
+                    library_code=False,
+                    library_code_at=None,
+                    library_code_reasons=None,
+                    stagnation_runs=0,
+                )
+            bus_emit("state_changed")
+        else:
+            # Legacy state.json RMW fallback (test-only scaffolding; the runtime
+            # loud-fails before reaching here without a backend). Re-read the
+            # latest state so we don't clobber functions added by a concurrent
+            # merge; only the entries we scored get overwritten.
+            with _state_lock:
+                latest = load_state()
+                latest_funcs = latest.setdefault("functions", {})
+                for key, func in refreshed_funcs.items():
+                    if key in latest_funcs:
+                        latest_funcs[key].update(func)
+                    else:
+                        latest_funcs[key] = func
+                _atomic_write_state(latest)
+            bus_emit("state_changed")
 
     # Record refresh metadata on the queue so the dashboard can display it
     queue = load_priority_queue()
