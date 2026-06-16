@@ -231,20 +231,27 @@ def test_one_shot_blacklist_flags_round_trip(storage_repo):
     rec["not_a_function_at"] = ts
     rec["decompile_timeout"] = True
     rec["decompile_timeout_at"] = ts
+    rec["recovery_pass_done"] = True
+    rec["recovery_pass_score"] = 42
+    rec["recovery_pass_at"] = ts
     repo.upsert_function(rec)
 
     got = repo.get_function("/test/foo.dll", "00400abc")
     assert got is not None
     assert got["not_a_function"] is True
     assert got["decompile_timeout"] is True
+    assert got["recovery_pass_done"] is True
+    assert got["recovery_pass_score"] == 42
     assert got["not_a_function_at"] is not None
     assert got["decompile_timeout_at"] is not None
+    assert got["recovery_pass_at"] is not None
 
     # Default for an untouched row is falsy (not None) on both backends.
     repo.upsert_function(_sample_function(addr="00400def", name="RealFunc"))
     plain = repo.get_function("/test/foo.dll", "00400def")
     assert not plain["not_a_function"]
     assert not plain["decompile_timeout"]
+    assert not plain["recovery_pass_done"]
 
 
 def test_get_returns_none_for_missing(storage_repo):

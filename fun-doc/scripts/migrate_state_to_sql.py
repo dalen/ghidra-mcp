@@ -106,6 +106,8 @@ _DIRECT_FIELDS = {
     # never set them.
     "decompile_timeout",
     "not_a_function",
+    "recovery_pass_done",
+    "recovery_pass_score",
     "library_code",
     "library_code_reasons",
     # name-source provenance (#204) — kept here so a state.json that
@@ -124,6 +126,7 @@ _RENAMED_FIELDS = {
     "last_escalated": "last_escalated_at",
     "decompile_timeout_at": "decompile_timeout_at",
     "not_a_function_at": "not_a_function_at",
+    "recovery_pass_at": "recovery_pass_at",
     "library_code_at": "library_code_at",
 }
 

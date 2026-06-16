@@ -1061,6 +1061,8 @@ _STATE_DIRECT_FIELDS = (
     # actually skipping). See the selector gates in select_candidates.
     "decompile_timeout",
     "not_a_function",
+    "recovery_pass_done",
+    "recovery_pass_score",
     "library_code",
     "deductions",
     "callees",
@@ -1127,6 +1129,8 @@ def _state_func_to_row(func_key, rec):
         out["decompile_timeout_at"] = _parse_state_ts(rec["decompile_timeout_at"])
     if "not_a_function_at" in rec:
         out["not_a_function_at"] = _parse_state_ts(rec["not_a_function_at"])
+    if "recovery_pass_at" in rec:
+        out["recovery_pass_at"] = _parse_state_ts(rec["recovery_pass_at"])
     if "library_code_at" in rec:
         out["library_code_at"] = _parse_state_ts(rec["library_code_at"])
     if "library_code_reasons" in rec:
@@ -1190,6 +1194,9 @@ def _row_to_state_func(row):
     if row.get("not_a_function_at") is not None:
         v = row["not_a_function_at"]
         out["not_a_function_at"] = v.isoformat() if hasattr(v, "isoformat") else v
+    if row.get("recovery_pass_at") is not None:
+        v = row["recovery_pass_at"]
+        out["recovery_pass_at"] = v.isoformat() if hasattr(v, "isoformat") else v
     if row.get("library_code_at") is not None:
         v = row["library_code_at"]
         out["library_code_at"] = v.isoformat() if hasattr(v, "isoformat") else v
@@ -3311,6 +3318,9 @@ def refresh_candidate_scores(
                     decompile_timeout_at=None,
                     not_a_function=False,
                     not_a_function_at=None,
+                    recovery_pass_done=False,
+                    recovery_pass_score=None,
+                    recovery_pass_at=None,
                     library_code=False,
                     library_code_at=None,
                     library_code_reasons=None,

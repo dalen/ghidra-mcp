@@ -785,3 +785,27 @@ def test_blacklist_flag_survives_state_row_round_trip(flag):
     # broken: the flag vanished on reload and the selector re-admitted it).
     state = {func_key: {**rec, **reloaded}}
     assert _keys(select_candidates(state, _queue())) == []
+
+
+def test_recovery_pass_done_survives_state_row_round_trip():
+    """recovery_pass_done (+ score + at) must round-trip so a massive function's
+    one complexity-forced recovery pass isn't re-run on every reload."""
+    from fun_doc import _row_to_state_func, _state_func_to_row
+
+    func_key = "/test/p::2000"
+    rec = _func(address="2000", score=70, fixable=20)
+    rec["recovery_pass_done"] = True
+    rec["recovery_pass_score"] = 70
+    rec["recovery_pass_at"] = "2026-06-16T09:00:00"
+
+    row = _state_func_to_row(func_key, rec)
+    assert row["recovery_pass_done"] is True
+    assert row["recovery_pass_score"] == 70
+    assert row.get("recovery_pass_at") is not None
+
+    reloaded = _row_to_state_func(row)
+    assert reloaded.get("recovery_pass_done") is True
+    assert reloaded.get("recovery_pass_score") == 70
+
+    state = {func_key: {**rec, **reloaded}}
+    assert _keys(select_candidates(state, _queue())) == []

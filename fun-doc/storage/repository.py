@@ -73,6 +73,9 @@ _UPDATABLE_WORKFLOW_FIELDS = {
     "decompile_timeout_at",
     "not_a_function",
     "not_a_function_at",
+    "recovery_pass_done",
+    "recovery_pass_score",
+    "recovery_pass_at",
     "deductions",
     "callees",
     # name-source provenance (#204)
