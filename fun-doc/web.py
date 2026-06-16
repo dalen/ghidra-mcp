@@ -1038,6 +1038,9 @@ class WorkerManager:
 def compute_skip_reason(func: dict, key: str, pinned_keys: set) -> str | None:
     """Return the selector skip reason for ``func``, or ``None`` if eligible.
 
+    Returns one of: ``library_code`` / ``propagation`` / ``decompile_timeout``
+    / ``not_a_function`` / ``stagnation`` / ``recovery_done`` / ``None``.
+
     Mirrors the gates in ``fun_doc.select_candidates`` exactly. Surfaced via
     the dashboard's function-list APIs so the UI can show "why isn't this
     function getting picked?" without users reading source. Keep in sync
@@ -1063,6 +1066,8 @@ def compute_skip_reason(func: dict, key: str, pinned_keys: set) -> str | None:
         return "propagation"
     if func.get("decompile_timeout") and not is_pinned:
         return "decompile_timeout"
+    if func.get("not_a_function") and not is_pinned:
+        return "not_a_function"
     if func.get("stagnation_runs", 0) >= 3 and not is_pinned:
         return "stagnation"
     if func.get("recovery_pass_done") and not is_pinned:

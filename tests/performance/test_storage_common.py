@@ -120,21 +120,32 @@ def storage_repo(request, tmp_path):
 
 
 def _apply_pg_migrations(engine, schema: str) -> None:
-    """Apply the PG migration into ``schema`` instead of the hardcoded fun_doc.
+    """Apply every PG migration into ``schema`` instead of the hardcoded fun_doc.
 
-    Reads the SQL file and rewrites the schema name in-place. Crude, but
-    fine for a 120-line bootstrap that only references one schema.
+    Reads each ``NNNN_*.sql`` migration (excluding the ``.sqlite.sql`` variants)
+    in version order and rewrites the schema name in-place. Crude, but fine for
+    a controlled set of hand-authored migrations that reference one schema.
+    Applying the full chain — not just 0001 — keeps later columns present in
+    the per-test schema (library_code @0002, name_source @0003, not_a_function
+    / decompile_timeout @0004) so cross-backend round-trip tests match what the
+    SQLite ``bootstrap_schema()`` path produces.
     """
     from sqlalchemy import text
 
-    sql_path = _FUNDOC_DIR / "db" / "migrations" / "0001_initial.sql"
-    sql = sql_path.read_text(encoding="utf-8").replace("fun_doc.", f'"{schema}".')
-    sql = sql.replace(
-        "CREATE SCHEMA IF NOT EXISTS fun_doc;",
-        f'CREATE SCHEMA IF NOT EXISTS "{schema}";',
+    mig_dir = _FUNDOC_DIR / "db" / "migrations"
+    files = sorted(
+        p for p in mig_dir.glob("[0-9]*.sql") if not p.name.endswith(".sqlite.sql")
     )
     with engine.begin() as conn:
-        conn.execute(text(sql))
+        for sql_path in files:
+            sql = sql_path.read_text(encoding="utf-8").replace(
+                "fun_doc.", f'"{schema}".'
+            )
+            sql = sql.replace(
+                "CREATE SCHEMA IF NOT EXISTS fun_doc;",
+                f'CREATE SCHEMA IF NOT EXISTS "{schema}";',
+            )
+            conn.execute(text(sql))
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +213,38 @@ def test_upsert_is_merge_not_replace(storage_repo):
     # values written by the first call.
     assert got["classification"] == "wrapper"
     assert got["name"] == "TestFn"
+
+
+def test_one_shot_blacklist_flags_round_trip(storage_repo):
+    """not_a_function / decompile_timeout must survive an upsert + get.
+
+    These one-shot blacklist flags previously had no backing column, so the
+    SQL round-trip dropped them — and because the worker reloads state from
+    the DB every selector pass, the selector never saw the flag and re-picked
+    the same data address forever (re-logging "NOT A FUNCTION" / "DECOMPILE
+    TIMEOUT" without ever skipping). This pins the column-level persistence.
+    """
+    repo = storage_repo
+    ts = datetime(2026, 6, 16, 9, 0, 0, tzinfo=timezone.utc)
+    rec = _sample_function(addr="00400abc", name="NotReallyAFunc")
+    rec["not_a_function"] = True
+    rec["not_a_function_at"] = ts
+    rec["decompile_timeout"] = True
+    rec["decompile_timeout_at"] = ts
+    repo.upsert_function(rec)
+
+    got = repo.get_function("/test/foo.dll", "00400abc")
+    assert got is not None
+    assert got["not_a_function"] is True
+    assert got["decompile_timeout"] is True
+    assert got["not_a_function_at"] is not None
+    assert got["decompile_timeout_at"] is not None
+
+    # Default for an untouched row is falsy (not None) on both backends.
+    repo.upsert_function(_sample_function(addr="00400def", name="RealFunc"))
+    plain = repo.get_function("/test/foo.dll", "00400def")
+    assert not plain["not_a_function"]
+    assert not plain["decompile_timeout"]
 
 
 def test_get_returns_none_for_missing(storage_repo):

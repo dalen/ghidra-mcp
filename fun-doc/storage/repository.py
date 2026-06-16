@@ -65,7 +65,14 @@ _UPDATABLE_WORKFLOW_FIELDS = {
     "is_thunk",
     "is_external",
     "is_thrashing",
+    # one-shot blacklist flags (#: not_a_function / decompile_timeout retry
+    # loop) — the worker sets these via update_function_state; they must be
+    # accepted by the partial-update path or the selector never sees them on
+    # reload and re-picks the same address forever.
+    "decompile_timeout",
     "decompile_timeout_at",
+    "not_a_function",
+    "not_a_function_at",
     "deductions",
     "callees",
     # name-source provenance (#204)

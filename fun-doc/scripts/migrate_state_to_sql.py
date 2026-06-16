@@ -101,6 +101,11 @@ _DIRECT_FIELDS = {
     "is_thrashing",
     "deductions",
     "callees",
+    # one-shot blacklist flags — fold cleanly into state.db when a legacy
+    # state.json already carried them. Schema defaults to FALSE for rows that
+    # never set them.
+    "decompile_timeout",
+    "not_a_function",
     "library_code",
     "library_code_reasons",
     # name-source provenance (#204) — kept here so a state.json that
@@ -118,6 +123,7 @@ _RENAMED_FIELDS = {
     "last_audited": "last_audited_at",
     "last_escalated": "last_escalated_at",
     "decompile_timeout_at": "decompile_timeout_at",
+    "not_a_function_at": "not_a_function_at",
     "library_code_at": "library_code_at",
 }
 

@@ -99,7 +99,10 @@ def build_metadata(schema: str | None = None) -> MetaData:
         Column("is_external", Boolean, default=False),
         # transient worker state
         Column("is_thrashing", Boolean, default=False),
+        Column("decompile_timeout", Boolean, default=False),
         Column("decompile_timeout_at", DateTime(timezone=True)),
+        Column("not_a_function", Boolean, default=False),
+        Column("not_a_function_at", DateTime(timezone=True)),
         Column("library_code", Boolean, default=False),
         Column("library_code_at", DateTime(timezone=True)),
         Column("library_code_reasons", JSON),

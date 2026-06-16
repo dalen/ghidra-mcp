@@ -752,3 +752,36 @@ def test_not_a_function_bypassed_by_pin():
     assert _keys(select_candidates(state, _queue())) == []
     result = select_candidates(state, _queue(pinned=["a::data"]))
     assert _keys(result) == ["a::data"]
+
+
+# ---------------------------------------------------------------------------
+# Persistence round-trip — the one-shot blacklist flags must survive the
+# state <-> SQL-row conversion, or the worker (which reloads state from the
+# backend every selector pass) re-picks the same address forever. This is the
+# exact bug behind "NOT A FUNCTION ... Marking and skipping" / "DECOMPILE
+# TIMEOUT ..." re-logging on every cycle without ever actually skipping.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("flag", ["not_a_function", "decompile_timeout"])
+def test_blacklist_flag_survives_state_row_round_trip(flag):
+    """_state_func_to_row -> _row_to_state_func must preserve the flag so the
+    reloaded state still trips the selector skip gate."""
+    from fun_doc import _row_to_state_func, _state_func_to_row
+
+    func_key = "/test/p::1000"
+    rec = _func(address="1000", score=70, fixable=20)
+    rec[flag] = True
+    rec[f"{flag}_at"] = "2026-06-16T09:00:00"
+
+    row = _state_func_to_row(func_key, rec)
+    assert row[flag] is True  # flag landed in the workflow row...
+    assert row.get(f"{flag}_at") is not None  # ...with its audit timestamp
+
+    reloaded = _row_to_state_func(row)
+    assert reloaded.get(flag) is True  # ...and survives the reload
+
+    # The reloaded entry must be excluded by the selector (this is what was
+    # broken: the flag vanished on reload and the selector re-admitted it).
+    state = {func_key: {**rec, **reloaded}}
+    assert _keys(select_candidates(state, _queue())) == []

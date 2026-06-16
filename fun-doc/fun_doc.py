@@ -1054,6 +1054,13 @@ _STATE_DIRECT_FIELDS = (
     "is_thunk",
     "is_external",
     "is_thrashing",
+    # One-shot blacklist flags. These must round-trip through the SQL backend:
+    # the worker reloads state every selector pass, so a flag that doesn't
+    # persist as a column gets dropped on reload and the selector re-picks the
+    # same address forever (re-detecting + re-logging the skip but never
+    # actually skipping). See the selector gates in select_candidates.
+    "decompile_timeout",
+    "not_a_function",
     "library_code",
     "deductions",
     "callees",
@@ -1118,6 +1125,8 @@ def _state_func_to_row(func_key, rec):
         out["last_result"] = rec["last_result"]
     if "decompile_timeout_at" in rec:
         out["decompile_timeout_at"] = _parse_state_ts(rec["decompile_timeout_at"])
+    if "not_a_function_at" in rec:
+        out["not_a_function_at"] = _parse_state_ts(rec["not_a_function_at"])
     if "library_code_at" in rec:
         out["library_code_at"] = _parse_state_ts(rec["library_code_at"])
     if "library_code_reasons" in rec:
@@ -1178,6 +1187,9 @@ def _row_to_state_func(row):
     if row.get("decompile_timeout_at") is not None:
         v = row["decompile_timeout_at"]
         out["decompile_timeout_at"] = v.isoformat() if hasattr(v, "isoformat") else v
+    if row.get("not_a_function_at") is not None:
+        v = row["not_a_function_at"]
+        out["not_a_function_at"] = v.isoformat() if hasattr(v, "isoformat") else v
     if row.get("library_code_at") is not None:
         v = row["library_code_at"]
         out["library_code_at"] = v.isoformat() if hasattr(v, "isoformat") else v
@@ -3227,6 +3239,11 @@ def refresh_candidate_scores(
             # user can retry after e.g. Ghidra analysis improvements.
             func.pop("decompile_timeout", None)
             func.pop("decompile_timeout_at", None)
+            # And not-a-function: refresh re-evaluates whether the address
+            # became a real function (e.g. after Ghidra re-analysis recovered
+            # code there). Clearing here mirrors the decompile_timeout reset.
+            func.pop("not_a_function", None)
+            func.pop("not_a_function_at", None)
             # Library-code auto-classification clears on refresh too — the
             # detector is conservative but not perfect, and the explicit
             # refresh gesture is the user saying "look at everything fresh."

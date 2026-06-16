@@ -6,7 +6,7 @@ getting picked?" without users reading source. The contract is:
 
   * Each row in the dashboard API gets a `skip_reason` field
   * The value is one of: `library_code` / `propagation` / `decompile_timeout`
-    / `stagnation` / `recovery_done` / `None` (eligible)
+    / `not_a_function` / `stagnation` / `recovery_done` / `None` (eligible)
   * Pinning bypasses every gate that respects pinning -- the helper
     must consult `pinned_keys` before those checks
 
@@ -123,6 +123,18 @@ def test_other_sources_not_skipped():
 
 def test_decompile_timeout_skip():
     assert compute_skip_reason(_func(decompile_timeout=True), "a::1", set()) == "decompile_timeout"
+
+
+def test_decompile_timeout_pin_bypasses_gate():
+    assert compute_skip_reason(_func(decompile_timeout=True), "a::1", {"a::1"}) is None
+
+
+def test_not_a_function_skip():
+    assert compute_skip_reason(_func(not_a_function=True), "a::1", set()) == "not_a_function"
+
+
+def test_not_a_function_pin_bypasses():
+    assert compute_skip_reason(_func(not_a_function=True), "a::1", {"a::1"}) is None
 
 
 def test_stagnation_at_threshold():
