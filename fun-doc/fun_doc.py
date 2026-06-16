@@ -265,14 +265,35 @@ def _get_project_folder() -> str:
     if _PROJECT_FOLDER_OVERRIDE:
         _PROJECT_FOLDER_CACHED = _PROJECT_FOLDER_OVERRIDE
         return _PROJECT_FOLDER_CACHED
+    # The live project_folder lives in the SQL backend's meta singleton —
+    # that's where load_state reads it. The legacy state.json went dead with
+    # the persistence swap and can hold a STALE folder from a previous project.
+    # Reading it here scoped the guard to the old project and rejected every
+    # call to the current one: observed state.json='/Mods/PD2-S12' while the
+    # live project was WAR.exe, so all /WAR.exe decompiles were scope-blocked,
+    # which fetch_function_data then mis-read as not_a_function. Prefer the
+    # repo; fall back to state.json only when no backend is available
+    # (test scaffolding / pre-migration installs).
+    pf = None
     try:
-        # state.json may not exist yet on a brand-new install; tolerate.
-        with open(STATE_FILE) as f:
-            state = json.load(f)
-        pf = (state.get("project_folder") or "").strip().rstrip("/")
-        _PROJECT_FOLDER_CACHED = pf
-    except (FileNotFoundError, json.JSONDecodeError, KeyError):
-        _PROJECT_FOLDER_CACHED = ""
+        repo = _get_storage_repo()
+    except SystemExit:
+        # _get_storage_repo loud-fails by design; the scope-guard helper must
+        # never be the thing that kills the process. Degrade to the fallback.
+        repo = None
+    if repo is not None:
+        try:
+            pf = (repo.get_meta() or {}).get("project_folder")
+        except Exception:
+            pf = None
+    if pf is None:
+        try:
+            # state.json may not exist yet on a brand-new install; tolerate.
+            with open(STATE_FILE) as f:
+                pf = json.load(f).get("project_folder")
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            pf = ""
+    _PROJECT_FOLDER_CACHED = (pf or "").strip().rstrip("/")
     return _PROJECT_FOLDER_CACHED
 
 
@@ -2363,6 +2384,15 @@ def fetch_function_data(program, address, mode="FIX"):
     if ghidra_last_call_offline():
         data["ghidra_offline"] = True
         return data
+    # Scope-guard rejection: we never reached Ghidra for this program (the
+    # client blocked the call as out-of-project). That's a config issue, not a
+    # data address — treat it as retryable like offline so the now-persistent
+    # not_a_function verdict can't permanently blacklist a real function on a
+    # misconfigured project_folder. (The scope_guard_block bus event already
+    # fires for visibility.)
+    if _is_scope_blocked(data["decompiled"]):
+        data["ghidra_offline"] = True
+        return data
 
     # Completeness
     raw = ghidra_get(
@@ -4065,6 +4095,19 @@ def _is_error_response(resp):
     if isinstance(resp, str) and resp.startswith("Error"):
         return True
     return False
+
+
+def _is_scope_blocked(resp):
+    """True if `resp` is the client-side scope-guard rejection (not a real
+    Ghidra answer). Such a response means we never reached Ghidra for this
+    program — it is NOT evidence the address lacks a function, so it must not
+    feed the not_a_function verdict (which is now persistent — a false hit
+    permanently blacklists a real function). See _scope_check_params."""
+    return (
+        isinstance(resp, dict)
+        and isinstance(resp.get("error"), str)
+        and "scope guard blocked" in resp["error"]
+    )
 
 
 def _variables_for_prompt(variables):
