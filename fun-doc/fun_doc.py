@@ -102,6 +102,8 @@ ignore_list = [
     "RenderClass__OnWorldOriginChanged",
     "Network__ResolveIPv4",
     "NiDX9FragmentShader__vmethod_e8", # @ 0x007b7d30
+    "Entity__IoBufferOp",
+    "JumpTable_afe980",
 ]
 
 # Force UTF-8 on stdout/stderr so printing Unicode from LLM responses
