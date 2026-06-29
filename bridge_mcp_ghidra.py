@@ -238,12 +238,18 @@ class GhidraValidationError(Exception):
 
 # Input validation patterns
 HEX_ADDRESS_PATTERN = re.compile(r"^0x[0-9a-fA-F]+$")
-SEGMENT_ADDRESS_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*:[0-9a-fA-F]+$")
-# Handles space:0xHEX form (e.g., mem:0x1000, code:0xFF00).
-# Must be checked BEFORE SEGMENT_ADDRESS_PATTERN because the 'x' in '0x' is not
-# in [0-9a-fA-F], so the existing pattern rejects this form entirely.
+# Space-qualified address: space:HEX or space::HEX (overlay), with optional 0x.
+# Ghidra memory-block (and therefore overlay-space) names are essentially
+# unconstrained, so the space-name class is "anything except colon or
+# whitespace" — the ':'/'::' separator is what distinguishes this from plain
+# hex. Ghidra's AddressFactory accepts both ':' and '::' and is case-sensitive
+# on the name (#184), so the bridge preserves case and never adds '0x' here.
+SEGMENT_ADDRESS_PATTERN = re.compile(r"^[^\s:]+::?[0-9a-fA-F]+$")
+# Handles the space::0xHEX / space:0xHEX form. Checked BEFORE SEGMENT_ADDRESS_PATTERN
+# because the 'x' in '0x' is not in [0-9a-fA-F]. Group 1 captures the name AND the
+# colon separator; group 2 captures the bare hex offset.
 SEGMENT_ADDR_WITH_0X_PATTERN = re.compile(
-    r"^([a-zA-Z_][a-zA-Z0-9_]*):0[xX]([0-9a-fA-F]+)$"
+    r"^([^\s:]+::?)0[xX]([0-9a-fA-F]+)$"
 )
 FUNCTION_NAME_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 TOOL_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
@@ -733,6 +739,7 @@ def sanitize_address(address: str) -> str:
 
     Handles:
     - space:0xHEX  -> space:HEX   (strip 0x; AddressFactory rejects 0x after colon)
+    - space::0xHEX -> space::HEX  (overlay; '::' separator and case preserved)
     - SPACE:HEX    -> SPACE:HEX   (preserve case — AddressFactory is case-sensitive; see #184)
     - 0xHEX        -> 0xhex       (lowercase)
     - HEX          -> 0xHEX       (add 0x prefix)
@@ -741,10 +748,11 @@ def sanitize_address(address: str) -> str:
         return address
     address = address.strip()
 
-    # Step 1: handle space:0xHEX form (checked first — 'x' not in [0-9a-fA-F])
+    # Step 1: handle space:0xHEX / space::0xHEX form (checked first — 'x' not in
+    # [0-9a-fA-F]). Group 1 already includes the ':'/'::' separator.
     m = SEGMENT_ADDR_WITH_0X_PATTERN.match(address)
     if m:
-        return f"{m.group(1)}:{m.group(2)}"  # case preserved (#184)
+        return f"{m.group(1)}{m.group(2)}"  # case + separator preserved (#184, overlays)
 
     # Step 2: valid space:HEX — pass through unchanged (#184)
     if SEGMENT_ADDRESS_PATTERN.match(address):
@@ -931,6 +939,7 @@ STATIC_TOOL_NAMES = {
     "load_tool_group",
     "unload_tool_group",
     "check_tools",
+    "search_tools",
     "import_file",
     # Debugger tools (Phase 1+2+3)
     "debugger_attach",
@@ -1587,6 +1596,62 @@ async def check_tools(tools: str) -> str:
         {
             "results": results,
             "summary": f"{callable_count}/{len(tool_names)} callable",
+        }
+    )
+
+
+@mcp.tool()
+async def search_tools(query: str, limit: int = 15) -> str:
+    """
+    Search the full Ghidra tool catalog by keyword — including tools whose group
+    is not currently loaded. Use this to discover the right tool without paying
+    the context cost of loading all groups (run the bridge with --lazy and search
+    on demand). Matches against tool name, description, and category.
+
+    Each result reports whether the tool is callable right now; if not, it
+    includes the exact load_tool_group(...) call needed to make it callable.
+
+    Args:
+        query: Space-separated keywords, e.g. "rename function" or "xref struct".
+        limit: Maximum number of results to return (default 15).
+    """
+    terms = [t.lower() for t in query.split() if t.strip()]
+    if not terms:
+        return json.dumps({"error": "Provide one or more search keywords"})
+
+    scored: list[tuple[int, dict]] = []
+    for td in _full_schema:
+        name = td.get("name", "")
+        category = td.get("category", "unknown")
+        desc = td.get("description", "") or ""
+        haystack = f"{name} {category} {desc}".lower()
+        score = 0
+        for term in terms:
+            if term in name.lower():
+                score += 3  # name hits rank highest
+            elif term in haystack:
+                score += 1
+        if score == 0:
+            continue
+        loaded = name in _dynamic_tool_names or name in STATIC_TOOL_NAMES
+        result = {
+            "name": name,
+            "group": category,
+            "status": "callable" if loaded else "not_loaded",
+            "description": desc[:160],
+        }
+        if not loaded:
+            result["fix"] = f'load_tool_group("{category}")'
+        scored.append((score, result))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    matches = [r for _, r in scored[: max(1, limit)]]
+    return json.dumps(
+        {
+            "query": query,
+            "match_count": len(scored),
+            "returned": len(matches),
+            "matches": matches,
         }
     )
 
