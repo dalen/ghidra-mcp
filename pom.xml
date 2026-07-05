@@ -6,7 +6,7 @@
     <groupId>com.xebyte</groupId>
     <artifactId>GhidraMCP</artifactId>
     <packaging>jar</packaging>
-    <version>5.14.1</version>
+    <version>5.15.0</version>
     <name>Ghidra MCP Server</name>
     <description>Production-ready Model Context Protocol server for Ghidra reverse engineering platform. Provides MCP-based tooling and automation for reverse engineering workflows: convention-enforcing rename/type/comment endpoints, batch operations, P-code emulation, live debugger integration, headless server, and Ghidra Server multi-version support.</description>
     <url>https://github.com/bethington/ghidra-mcp</url>
@@ -19,6 +19,10 @@
         <maven.build.timestamp.format>yyyyMMdd-HHmmss</maven.build.timestamp.format>
         <!-- Build number - use current time as unique identifier -->
         <build.number>${maven.build.timestamp}</build.number>
+        <!-- Default empty so surefire's @{argLine} resolves even when the
+             JaCoCo agent is skipped (jacoco.skip=true); prepare-agent
+             overwrites this property at runtime. -->
+        <argLine></argLine>
     </properties>
     <licenses>
         <license>
@@ -164,14 +168,38 @@
             </resource>
         </resources>
         <plugins>
-            <!-- Maven Surefire Plugin — enable Byte Buddy experimental mode for Java 25 -->
+            <!-- Maven Surefire Plugin — enable Byte Buddy experimental mode for Java 25.
+                 @{argLine} late-binds the JaCoCo agent injected by prepare-agent. -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.5.6</version>
                 <configuration>
-                    <argLine>-Dnet.bytebuddy.experimental=true</argLine>
+                    <argLine>@{argLine} -Dnet.bytebuddy.experimental=true</argLine>
                 </configuration>
+            </plugin>
+            <!-- JaCoCo — line coverage for the offline test tier. Report lands in
+                 target/site/jacoco/ on every `mvn test`. Baseline-only for now
+                 (no coverage gate); disable with -Djacoco.skip=true. -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>0.8.13</version>
+                <executions>
+                    <execution>
+                        <id>jacoco-prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>jacoco-report</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>
+                </executions>
             </plugin>
             <!-- Maven Compiler Plugin -->
             <plugin>

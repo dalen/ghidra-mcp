@@ -20,13 +20,13 @@
 >
 > If Ghidra MCP saves you time, consider [sponsoring the project](https://github.com/sponsors/bethington). One-time and recurring support both help fund compatibility updates, production hardening, docs, and new tooling.
 
-A production-ready Model Context Protocol (MCP) server that bridges Ghidra's powerful reverse engineering capabilities with modern AI tools and automation frameworks. **251 MCP tools**, battle-tested AI workflows, and the most comprehensive Ghidra-MCP integration available — now including P-code emulation, live debugger integration, and PCode-graph data flow analysis.
+A production-ready Model Context Protocol (MCP) server that bridges Ghidra's powerful reverse engineering capabilities with modern AI tools and automation frameworks. **256 MCP tools**, battle-tested AI workflows, and the most comprehensive Ghidra-MCP integration available — now including P-code emulation, live debugger integration, and PCode-graph data flow analysis.
 
 ## Why Ghidra MCP?
 
 Most Ghidra MCP implementations give you a handful of read-only tools and call it a day. This project is different — it was built by a reverse engineer who uses it daily on real binaries, not as a demo.
 
-- **251 MCP tools** — 3x more than any competing implementation. Not just read operations — full write access for renaming, typing, commenting, structure creation, script execution, P-code emulation, and live debugging.
+- **256 MCP tools** — 3x more than any competing implementation. Not just read operations — full write access for renaming, typing, commenting, structure creation, script execution, P-code emulation, and live debugging.
 - **Battle-tested AI workflows** — Proven documentation workflows (V5) refined across hundreds of functions. Includes step-by-step prompts, Hungarian notation reference, batch processing guides, and orphaned code discovery.
 - **Production-grade reliability** — Atomic transactions, batch operations (93% API call reduction), configurable timeouts, and graceful error handling. No silent failures.
 - **Cross-binary documentation transfer** — SHA-256 function hash matching propagates documentation across binary versions automatically. Document once, apply everywhere.
@@ -56,7 +56,7 @@ v5.0 moves conventions from "things to remember" into the tool layer, where they
 
 ### Core MCP Integration
 - **Full MCP Compatibility** — Complete implementation of Model Context Protocol
-- **251 MCP Tools** — Comprehensive API surface covering every aspect of binary analysis
+- **256 MCP Tools** — Comprehensive API surface covering every aspect of binary analysis
 - **Production-Ready Reliability** — Atomic transactions, batch operations, configurable timeouts
 - **Real-time Analysis** — Live integration with Ghidra's analysis engine
 
@@ -258,7 +258,7 @@ v5.0 moves conventions from "things to remember" into the tool layer, where they
      "mcpServers": {
        "ghidra": {
          "command": "uv",
-         "args": ["run", "--script", "/path/to/ghidra-mcp/bridge_mcp_ghidra.py"]
+         "args": ["run", "--directory", "/path/to/ghidra-mcp", "bridge-mcp-ghidra"]
        }
      }
    }
@@ -281,12 +281,12 @@ yay -S ghidra-mcp        # or ghidra-mcp-git
 
 #### Option 1: Stdio Transport (Recommended for AI tools)
 ```bash
-python bridge_mcp_ghidra.py
+uv run bridge-mcp-ghidra          # or: python -m bridge_mcp_ghidra
 ```
 
 #### Option 2: Streamable HTTP Transport (Recommended for web/HTTP clients)
 ```bash
-python bridge_mcp_ghidra.py --transport streamable-http --mcp-host 127.0.0.1 --mcp-port 8081
+uv run bridge-mcp-ghidra --transport streamable-http --mcp-host 127.0.0.1 --mcp-port 8081
 ```
 
 MCP client config for the HTTP transport (add to your client's MCP config file):
@@ -302,7 +302,7 @@ MCP client config for the HTTP transport (add to your client's MCP config file):
 
 #### Option 3: SSE Transport (Deprecated — use streamable-http instead)
 ```bash
-python bridge_mcp_ghidra.py --transport sse --mcp-host 127.0.0.1 --mcp-port 8081
+uv run bridge-mcp-ghidra --transport sse --mcp-host 127.0.0.1 --mcp-port 8081
 ```
 
 #### Bridge advanced flags
@@ -315,6 +315,33 @@ python bridge_mcp_ghidra.py --transport sse --mcp-host 127.0.0.1 --mcp-port 8081
 | `--lazy` | off | Load only the default tool groups on connect. Faster startup, but MCP clients that don't support `tools/list_changed` will see an incomplete tool list. Not recommended for Claude Code. |
 | `--no-lazy` | (default) | Load all tool groups immediately on connect. Required for most AI clients. |
 | `--default-groups` | `listing,function,program` | Comma-separated groups loaded on connect when `--lazy` is set. |
+
+#### Strict program routing (multi-program safety)
+
+Set `GHIDRA_MCP_REQUIRE_PROGRAM_SELECTORS=1` to make the bridge refuse any program-scoped
+call that omits a program selector, returning a clear error instead of letting the call
+ride the server's shared "current program" (the one `switch_program` and the
+active GUI tab move).
+
+```bash
+export GHIDRA_MCP_REQUIRE_PROGRAM_SELECTORS=1
+uv run bridge-mcp-ghidra
+```
+
+Without this, a call that leaves `program=` out runs against whichever program
+is current, which is fine for a single-program workflow but a hazard once
+several programs are open: the call can read or edit the wrong binary with no
+error. The hazard is worse when more than one client shares a server, since
+each one moves that current-program global out from under the others.
+
+With strict mode on, every program-scoped call must name its target. This
+covers every selector that picks an open program: plain `program=` and the
+cross-program tools' `source_program`/`target_program` or `program_a`/`program_b`
+(declared required, but the server still falls back to the current program when
+one arrives empty). A forgotten selector surfaces as a loud error on the first
+bad call instead of a silent write to the wrong binary. Tools with no program
+selector (`open_program` and `close_program` take `path`/`name`) are unaffected.
+Off by default: with the variable unset the bridge sends calls unchanged.
 
 #### Reducing tool-context overhead
 
@@ -336,8 +363,8 @@ model **discover** the rest on demand instead of registering everything:
 
 #### Optional: Start the standalone debugger server
 ```bash
-python -m pip install -r requirements-debugger.txt
-python -m debugger
+uv sync --group debugger
+uv run python -m debugger
 ```
 
 The debugger server listens on `http://127.0.0.1:8099/` by default and is
@@ -464,12 +491,12 @@ If no password is found, Ghidra shows its normal GUI prompt. Set these in `.env`
 ### `python -m debugger` fails with `ModuleNotFoundError` for `pybag` or `comtypes`
 
 **Cause:** The standalone debugger server uses optional Windows-only Python
-dependencies that are not installed by the base requirements file.
+dependencies that are not installed by default.
 
 **Solution:**
 ```text
-python -m pip install -r requirements-debugger.txt
-python -m debugger
+uv sync --group debugger
+uv run python -m debugger
 ```
 
 If you have both a global Python and a project venv, make sure you install
@@ -526,7 +553,7 @@ python -m tools.setup install-ghidra-deps --ghidra-path "C:\ghidra_12.1.2_PUBLIC
 
 ## 📊 Production Performance
 
-- **MCP Tools**: 251 tools fully implemented
+- **MCP Tools**: 256 tools fully implemented
 - **Speed**: Sub-second response for most operations
 - **Efficiency**: 93% reduction in API calls via batch operations
 - **Reliability**: Atomic transactions with all-or-nothing semantics
@@ -767,7 +794,7 @@ See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 ### Components
 
-- **bridge_mcp_ghidra.py** — Python MCP server that translates MCP protocol to HTTP calls (225 catalog entries)
+- **python/bridge_mcp_ghidra/** — Python MCP server package (ships as the `ghidra-mcp-bridge` wheel; `bridge-mcp-ghidra` console script) that translates MCP protocol to HTTP calls (225 catalog entries)
 - **GhidraMCP.jar** — Ghidra plugin that exposes analysis capabilities via HTTP (175 GUI endpoints)
 - **GhidraMCPHeadlessServer** — Standalone headless server — 183 endpoints, no GUI required
 - **ghidra_scripts/** — Collection of automation scripts for common tasks
@@ -799,7 +826,7 @@ The authoritative build system today is Maven. `tools.setup`, the VS Code tasks,
 | `clean` | Remove Maven/Gradle build outputs (`target/`, `build/`). |
 | `clean-all` | Remove build outputs plus local cache artifacts (`.m2` Ghidra JARs, etc.). |
 | `install-ghidra-deps` | Install only the Ghidra JARs into `~/.m2`. Useful when the build environment changes. |
-| `install-python-deps` | Install only the Python requirements files. |
+| `install-python-deps` | Install the Python dependency groups via `uv sync`. |
 | `run-tests` | Run the Java offline test suite (no live Ghidra needed). |
 | `verify-version` | Check that version strings are consistent across `pom.xml`, `CHANGELOG.md`, and `README.md`. |
 | `bump-version --new X.Y.Z` | Atomically update all version references. Pass `--tag` to create a git tag. |
@@ -845,7 +872,8 @@ python -m tools.setup --help
 ### Project Structure
 ```
 ghidra-mcp/
-├── bridge_mcp_ghidra.py     # MCP server (Python, 225 catalog entries)
+├── pyproject.toml           # uv project (ghidra-mcp-bridge wheel + dependency groups)
+├── python/bridge_mcp_ghidra/ # MCP server package (Python, 225 catalog entries)
 ├── src/main/java/           # Ghidra plugin + headless server (Java)
 │   └── com/xebyte/
 │       ├── GhidraMCPPlugin.java         # GUI plugin (196 endpoints)
@@ -962,7 +990,7 @@ docker-compose up -d ghidra-mcp
 
 # Test connection
 curl http://localhost:8089/check_connection
-# Connection OK - GhidraMCP Headless Server v5.14.1
+# Connection OK - GhidraMCP Headless Server v5.15.0
 ```
 
 ### Headless API Workflow
@@ -1028,7 +1056,7 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 
 | Metric | Value |
 |--------|-------|
-| **Version** | 5.14.1 |
+| **Version** | 5.15.0 |
 | **MCP Tools** | 249 fully implemented |
 | **GUI Endpoints** | 196 (GhidraMCPPlugin) |
 | **Headless Endpoints** | 195 (GhidraMCPHeadlessServer) |

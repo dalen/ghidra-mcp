@@ -2,22 +2,35 @@
 
 ## Overview
 
-MCP server bridging Ghidra reverse engineering with AI tools. 251 MCP tools for binary analysis.
+MCP server bridging Ghidra reverse engineering with AI tools. 256 MCP tools for binary analysis.
 
-- **Package**: `com.xebyte` | **Version**: 5.14.1 | **Java**: 21 LTS | **Ghidra**: 12.1.2
+- **Package**: `com.xebyte` | **Version**: 5.15.0 | **Java**: 21 LTS | **Ghidra**: 12.1.2
 
 ## Boil the ocean
 
 The marginal cost of completeness is near zero with AI. Do the whole thing. Do it right. Do it with tests. Do it with documentation. Do it so well that Ben is genuinely impressed — not politely satisfied, actually impressed. Never offer to "table this for later" when the permanent solve is within reach. Never leave a dangling thread when tying it off takes five more minutes. Never present a workaround when the real fix exists. The standard isn't "good enough" — it's "holy shit, that's done." Search before building. Test before shipping. Ship the complete thing. When Ben asks for something, the answer is the finished product, not a plan to build it. Time is not an excuse. Fatigue is not an excuse. Complexity is not an excuse. Boil the ocean.
 
+**Scope of "boil the ocean": code, analysis, and local work — never public or community actions.** It means finish the *engineering*. It does NOT mean act autonomously on the community's behalf. See the next section.
+
+## Community interaction (read-only by default)
+
+This is a public repo with real external contributors. Their issues, PRs, and commits are theirs, not yours to dispose of. Reading is always fine; every write below is the human maintainer's to do, and you may only *draft* text for Ben to review and post himself.
+
+- **Never edit, close, comment on, merge, or reopen another person's issue or PR** without Ben's explicit, per-action go-ahead. Never edit anyone's issue/PR/comment *text* — that reads as tampering and is never acceptable.
+- **Draft / WIP / "do not merge" means hands off.** Never cherry-pick, merge, or otherwise pull in a draft PR's work. Draft is the contributor's signal that it isn't ready; respect it.
+- **To use a contributor's work, merge their PR through the normal flow** (which credits them) — never extract the commit around them or push it to `main` directly.
+- **Never post AI-generated text as if it were Ben's own analysis**, and never post a claim about someone else's work without verifying it against the code first.
+- When Ben asks for a reply to a contributor, produce a short draft *for him to send in his own words* — do not post it, and do not make it sound machine-generated.
+- A local `.claude/` hook (`block-community-github-writes.py`) enforces a slice of this by denying write-shaped `gh` commands; treat that as a backstop, not the boundary. The boundary is this section.
+
 ## Architecture
 
 ```
-AI Tools <-> MCP Bridge (bridge_mcp_ghidra.py) <-> Ghidra Plugin (GhidraMCPPlugin.jar)
+AI Tools <-> MCP Bridge (python/bridge_mcp_ghidra/) <-> Ghidra Plugin (GhidraMCPPlugin.jar)
 ```
 
 - **Plugin**: `src/main/java/com/xebyte/GhidraMCPPlugin.java` -- HTTP server, delegates to services
-- **Bridge**: `bridge_mcp_ghidra.py` (~2,200 lines) -- dynamic tool registration from `/mcp/schema` + static tools (7 instance/tool-group/import: `list_instances`, `connect_instance`, `list_tool_groups`, `load_tool_group`, `unload_tool_group`, `check_tools`, `import_file`; + 22 debugger proxy via `GHIDRA_DEBUGGER_URL`)
+- **Bridge**: `python/bridge_mcp_ghidra/` (package, split into focused modules: `config`, `state`, `server`, `validation`, `transport`, `discovery`, `schema`, `dispatch`, `registry`, `static_tools`, `debugger`, `cli`) -- dynamic tool registration from `/mcp/schema` + static tools (7 instance/tool-group/import: `list_instances`, `connect_instance`, `list_tool_groups`, `load_tool_group`, `unload_tool_group`, `check_tools`, `import_file`; + 22 debugger proxy via `GHIDRA_DEBUGGER_URL`). Ships as the `ghidra-mcp-bridge` wheel; `bridge-mcp-ghidra` console script. Cross-module functions are called module-qualified (e.g. `transport.do_request`, `dispatch.dispatch_get`) and mutable runtime state lives in `state.py`, so each function has one canonical mock-patch target.
 - **Service Layer**: `src/main/java/com/xebyte/core/` -- 14 service classes (~20K lines), `@McpTool`/`@Param` annotated. v5.4.0 adds `EmulationService` (P-code emulation), `DebuggerService` (TraceRmi wrapping — GUI-only)
 - **Debugger (Python)**: `debugger/` -- standalone HTTP server on port 8099 (engine, protocol, tracing, address_map, d2/ conventions). Bridge proxies via `GHIDRA_DEBUGGER_URL` env var.
 - **Headless**: `src/main/java/com/xebyte/headless/` -- standalone server without GUI. Includes `HeadlessManagementService` for program/project lifecycle.
@@ -94,11 +107,15 @@ state when modal dialogs may be present.
 ## Running the MCP Server
 
 ```bash
-python bridge_mcp_ghidra.py                  # stdio (recommended for AI tools)
-python bridge_mcp_ghidra.py --transport sse   # SSE (web/HTTP clients)
-python -m pip install -r requirements-debugger.txt  # optional debugger deps
-python -m debugger                            # standalone debugger server on :8099
+uv run bridge-mcp-ghidra                       # stdio (recommended for AI tools)
+uv run bridge-mcp-ghidra --transport sse       # SSE (web/HTTP clients)
+uv run python -m bridge_mcp_ghidra             # equivalent module form
+uv sync --group debugger                       # optional debugger deps
+uv run python -m debugger                      # standalone debugger server on :8099
 ```
+
+The bridge is a package under `python/bridge_mcp_ghidra/` and ships as a wheel
+(`ghidra_mcp_bridge`); installs expose the `bridge-mcp-ghidra` console script.
 
 Ghidra HTTP endpoint: `http://127.0.0.1:8089`
 
@@ -108,7 +125,7 @@ Ghidra HTTP endpoint: `http://127.0.0.1:8089`
 2. AnnotationScanner auto-discovers it -- no bridge or registry changes needed
 3. Add entry to `tests/endpoints.json` with path, method, category, description
 
-For complex tools needing bridge-side logic (retries, multi-call orchestration), add a static `@mcp.tool()` in `bridge_mcp_ghidra.py` and add the name to `STATIC_TOOL_NAMES`.
+For complex tools needing bridge-side logic (retries, multi-call orchestration), add a static `@mcp.tool()` in `python/bridge_mcp_ghidra/static_tools.py` (or `debugger.py`) and add the name to `STATIC_TOOL_NAMES` in `config.py`.
 
 ## Code Conventions
 
@@ -156,10 +173,10 @@ Find the file(s) you edited below; run everything in that row. Always include th
 | Add/modify `@McpTool` / `@Param` annotation | Offline (Java) first — `EndpointsJsonParityTest` will fail if `tests/endpoints.json` is stale. Regenerate: `mvn test -Dtest=RegenerateEndpointsJson -Dregenerate=true`. Then Integration (Java). |
 | `src/main/java/com/xebyte/GhidraMCPPlugin.java` (HTTP routes) | Offline (Java) + `EndpointRegistrationTest` (integration) + `tests/performance/test_http_concurrency.py`. For UDS/TCP defaults + TCP port-range fallback (#175): manual verification with port 8089 occupied, expect bind on 8090; `/mcp/instance_info → tcp_port` should report the actual bound port. |
 | `src/main/java/com/xebyte/headless/*` | Offline (Java) + `tests/unit/test_setup_ghidra.py` + Integration (Java) headless run |
-| `bridge_mcp_ghidra.py` | `tests/unit/test_bridge_utils.py tests/unit/test_mcp_tools.py tests/unit/test_mcp_tool_functions.py tests/unit/test_response_schemas.py tests/unit/test_endpoint_catalog.py`. For multi-candidate socket dir scan (#170): `TestGetSocketDirCandidates` + `TestDiscoverInstancesMultiDir`. For TCP port-range scanner (#175): `TestTcpPortScan`. Bridge size cap currently 2250 lines — bump deliberately if exceeded. |
+| `python/bridge_mcp_ghidra/*` (bridge package) | `tests/unit/test_bridge_utils.py tests/unit/test_mcp_tools.py tests/unit/test_mcp_tool_functions.py tests/unit/test_response_schemas.py tests/unit/test_endpoint_catalog.py tests/unit/test_project_consistency.py`. For multi-candidate socket dir scan (#170): `TestGetSocketDirCandidates` + `TestDiscoverInstancesMultiDir`. For TCP port-range scanner (#175): `TestTcpPortScan`. For debugger-tool platform gating: `TestDebuggerEnabled` + `TestDebuggerToolRegistration`. Per-module size cap is 800 lines (`test_bridge_modules_stay_focused`). Mock-patch targets are module-qualified (e.g. `bridge_mcp_ghidra.dispatch.dispatch_get`, `bridge_mcp_ghidra.transport.do_request`); mutable globals live in `bridge_mcp_ghidra.state`. |
 | `fun-doc/library_code_detector.py` — heuristic library-code classifier | `tests/performance/test_library_code_detector.py` (19-case unit suite) + `tests/performance/test_selector_invariants.py` (3 selector-skip cases). Live spot-check on a binary known to contain CRT/STL (e.g. anything compiled with MSVC `/MT`): confirm functions like `ParseSignedShort` classify but real user code (e.g. exported APIs) does not. |
 | `fun-doc/fun_doc.py` — state, sessions, locking, selector, scoring | `tests/performance/test_state_atomicity.py tests/performance/test_state_lock_reentrant.py tests/performance/test_selector_invariants.py tests/performance/test_event_bus_drain.py` + fun-doc benchmark (`--mock --tier fast --compare`) |
-| `fun-doc/fun_doc.py` — provider routing, prompt construction | `tests/performance/test_provider_selection.py tests/performance/test_ghidra_offline.py` + fun-doc benchmark |
+| `fun-doc/fun_doc.py` — provider routing, prompt construction | `tests/performance/test_provider_selection.py tests/performance/test_ghidra_offline.py tests/performance/test_globals_worker.py` + fun-doc benchmark |
 | `fun-doc/web.py` — worker loop, heartbeats, dashboard | `tests/performance/test_state_atomicity.py tests/performance/test_worker_watchdog.py tests/performance/test_dashboard_single_instance.py tests/performance/test_worker_config_snapshot.py` |
 | `fun-doc/inventory_scorer.py` | `tests/performance/test_inventory_scorer.py` |
 | `fun-doc/provider_pause.py` | `tests/performance/test_provider_pause.py` |
@@ -169,7 +186,7 @@ Find the file(s) you edited below; run everything in that row. Always include th
 | `debugger/*` | `tests/unit/test_address_map.py tests/unit/test_d2_conventions.py tests/unit/test_debugger_engine.py tests/unit/test_debugger_server.py tests/unit/test_windbg.py` |
 | `tools/setup/*`, `build.gradle`, `pom.xml` | `tests/unit/test_setup_cli.py tests/unit/test_setup_ghidra.py tests/unit/test_gradle_tasks.py tests/unit/test_version_bump.py tests/unit/test_project_consistency.py` |
 | `tests/endpoints.json` hand-edit | Offline (Java) — `EndpointsJsonParityTest` verifies every `@McpTool` is listed and hand-authored descriptions are preserved |
-| CLI: `bridge_mcp_ghidra.py --transport`, `tools.setup` subcommands | `tests/unit/test_setup_cli.py` + manual invocation |
+| CLI: `bridge-mcp-ghidra --transport` / `python -m bridge_mcp_ghidra`, `tools.setup` subcommands | `tests/unit/test_setup_cli.py` + manual invocation |
 
 ### Commands
 
@@ -245,7 +262,7 @@ mvn test -Dtest=RegenerateEndpointsJson -Dregenerate=true
 - `src/main/java/com/xebyte/core/NamingConventions.java` — any change to the validation cascade
 - `src/main/java/com/xebyte/core/*.java` service changes that alter MCP tool behavior
 - `tests/endpoints.json` — tool schema / description changes (affects what the worker calls)
-- `bridge_mcp_ghidra.py` — bridge-level prompt caching, tool orchestration, provider routing
+- `python/bridge_mcp_ghidra/` — bridge-level prompt caching, tool orchestration, provider routing
 - The provider client wrappers (minimax / gemini / claude / codex invocation paths)
 - `priority_queue.json`'s `config.provider_models` — the benchmark tests whatever model table is live
 

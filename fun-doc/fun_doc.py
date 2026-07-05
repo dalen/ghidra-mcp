@@ -140,8 +140,8 @@ except ImportError:
         "  1. Use the project venv:\n"
         "       .venv/Scripts/python.exe -u fun_doc.py  (Windows)\n"
         "       .venv/bin/python    -u fun_doc.py       (Linux/macOS)\n"
-        "  2. Install the missing dependency into the current interpreter:\n"
-        "       pip install -r requirements.txt\n"
+        "  2. Install the fun-doc dependency group with uv:\n"
+        "       uv sync --group fun-doc\n"
         "\n"
         "Refusing to start with a missing storage backend rather than silently\n"
         "falling back to legacy state.json -- your workflow updates would not\n"
@@ -954,6 +954,10 @@ def _default_state():
 
 _storage_repo = None
 _storage_repo_failed = False  # cache import-time failure to avoid retry storm
+# Serializes lazy construction: without it, a worker/watchdog thread and the
+# main thread can both see _storage_repo is None and race bootstrap_schema()
+# against the same SQLite file (UNIQUE failure on schema_versions).
+_storage_repo_lock = threading.Lock()
 
 
 def _get_storage_repo():
@@ -981,6 +985,18 @@ def _get_storage_repo():
         return _storage_repo
     if _storage_repo_failed:
         return None
+    with _storage_repo_lock:
+        # Double-checked: another thread may have built it while we waited.
+        if _storage_repo is not None:
+            return _storage_repo
+        if _storage_repo_failed:
+            return None
+        return _build_storage_repo()
+
+
+def _build_storage_repo():
+    """Build the repository. Caller must hold _storage_repo_lock."""
+    global _storage_repo, _storage_repo_failed
     try:
         # Read storage block from priority_queue.json if present.
         config_block = None
@@ -1054,6 +1070,10 @@ _STATE_DIRECT_FIELDS = (
     "is_thunk",
     "is_external",
     "is_thrashing",
+    # selector one-shot blacklist flags — see select_candidates() L2983/2992/3028
+    "recovery_pass_done",
+    "decompile_timeout",
+    "not_a_function",
     "library_code",
     "deductions",
     "callees",
@@ -2938,6 +2958,29 @@ def save_priority_queue(queue):
         tmp_path.replace(PRIORITY_QUEUE_FILE)
 
 
+_CONFORMANCE_PROTECTED_PATH = Path(__file__).resolve().parent / "conformance_protected.json"
+_conformance_protected_cache = None
+
+
+def load_conformance_protected(force_reload=False):
+    """Set of fun-doc function keys ('<program>::<address>') that carry an
+    OpenD2 conformance tag in Ghidra (ANALYZED_RUNTIME / ORACLE / PORTED /
+    PROVEN). These are hand-verified against the live PD2-S12 process and/or
+    ported to the OpenD2 clone, so the auto-doc selector must NEVER pick them —
+    a cheap worker could overwrite a runtime-verified plate. Loaded from
+    conformance_protected.json (generated from Ghidra tags); cached; empty set
+    when the file is absent so this is a no-op on installs without it."""
+    global _conformance_protected_cache
+    if _conformance_protected_cache is None or force_reload:
+        try:
+            with open(_CONFORMANCE_PROTECTED_PATH, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            _conformance_protected_cache = set((data.get("protected_keys") or {}).keys())
+        except (FileNotFoundError, ValueError, OSError):
+            _conformance_protected_cache = set()
+    return _conformance_protected_cache
+
+
 def select_candidates(funcs, queue=None, active_binary=None, with_scoring_lane=None):
     """Canonical work-queue selector. Used by both fun_doc CLI and web dashboard.
 
@@ -2961,6 +3004,7 @@ def select_candidates(funcs, queue=None, active_binary=None, with_scoring_lane=N
         queue = load_priority_queue()
     pinned_list = list(queue.get("pinned", []))
     pinned = set(pinned_list)
+    conformance_protected = load_conformance_protected()
     cfg = queue.get("config") or DEFAULT_QUEUE_CONFIG
     good_enough = cfg.get("good_enough_score", 80)
     require_scored = (
@@ -2980,6 +3024,15 @@ def select_candidates(funcs, queue=None, active_binary=None, with_scoring_lane=N
             continue
         is_pinned = key in pinned
         if active_binary and func.get("program_name") != active_binary:
+            continue
+
+        # Conformance-protected: functions carrying an OpenD2 conformance tag
+        # in Ghidra (ANALYZED_RUNTIME / ORACLE / PORTED / PROVEN) are
+        # hand-verified against the live PD2-S12 process and/or already ported
+        # to the OpenD2 clone. NEVER auto-document them — a cheap worker could
+        # overwrite a runtime-verified plate. Pinning bypasses for a deliberate
+        # re-document. Source: conformance_protected.json (from Ghidra tags).
+        if key in conformance_protected and not is_pinned:
             continue
 
         score = func.get("score", 0)
@@ -3217,25 +3270,19 @@ def refresh_candidate_scores(
             func["is_leaf"] = info["is_leaf"]
             func["classification"] = info["classification"]
             func["deductions"] = info["deductions"]
-            # Clear recovery-pass one-shot flag so the user can re-run these
-            # functions after a refresh — the refresh gesture is an explicit
-            # "look at everything fresh" signal.
-            func.pop("recovery_pass_done", None)
-            func.pop("recovery_pass_score", None)
-            func.pop("recovery_pass_at", None)
-            # Same for decompile-timeout: refresh clears the blacklist so the
-            # user can retry after e.g. Ghidra analysis improvements.
-            func.pop("decompile_timeout", None)
-            func.pop("decompile_timeout_at", None)
-            # Library-code auto-classification clears on refresh too — the
-            # detector is conservative but not perfect, and the explicit
-            # refresh gesture is the user saying "look at everything fresh."
-            func.pop("library_code", None)
-            func.pop("library_code_at", None)
-            func.pop("library_code_reasons", None)
-            # And the stagnation counter: a refresh is the user saying
-            # "re-score this from scratch, I'm willing to try again."
-            func.pop("stagnation_runs", None)
+            # Clear one-shot blacklist flags. Explicit False/None (not pop)
+            # so _state_func_to_row forwards the cleared value to the SQL
+            # column — pop() would just omit the key and leave the column
+            # at its old True. (H23)
+            func["recovery_pass_done"] = False
+            func["recovery_pass_score"] = None
+            func["recovery_pass_at"] = None
+            func["decompile_timeout"] = False
+            func["decompile_timeout_at"] = None
+            func["library_code"] = False
+            func["library_code_at"] = None
+            func["library_code_reasons"] = None
+            func["stagnation_runs"] = 0
             prog_refreshed += 1
             if abs(info["score"] - old_score) >= 5:
                 prog_stale += 1
@@ -3245,25 +3292,30 @@ def refresh_candidate_scores(
             by_program_stats[prog] = {"refreshed": prog_refreshed, "stale": prog_stale}
 
     if save and refreshed > 0:
-        # Read-modify-write: re-read the latest state from disk before saving
-        # so we don't clobber functions that were added (e.g. by a concurrent
-        # state merge) between when this refresh started and now. Only the
-        # specific function entries we scored get overwritten.
         refreshed_funcs = {
             c["key"]: c["func"]
             for prog_items in by_prog.values()
             for c in prog_items
             if c["func"].get("score") is not None
         }
+        repo = _get_storage_repo()
         with _state_lock:
-            latest = load_state()
-            latest_funcs = latest.setdefault("functions", {})
-            for key, func in refreshed_funcs.items():
-                if key in latest_funcs:
-                    latest_funcs[key].update(func)
-                else:
-                    latest_funcs[key] = func
-            _atomic_write_state(latest)
+            if repo is not None:
+                # H23: write to the SQL backend, not the dead state.json.
+                # Mirror update_function_state's repo path per-key so the
+                # accumulator-merge + run-history semantics stay identical.
+                for key, func in refreshed_funcs.items():
+                    _update_function_via_repo(repo, key, func)
+            else:
+                # Legacy fallback (test-only) — preserve old RMW behavior.
+                latest = load_state()
+                latest_funcs = latest.setdefault("functions", {})
+                for key, func in refreshed_funcs.items():
+                    if key in latest_funcs:
+                        latest_funcs[key].update(func)
+                    else:
+                        latest_funcs[key] = func
+                _atomic_write_state(latest)
         bus_emit("state_changed")
 
     # Record refresh metadata on the queue so the dashboard can display it
@@ -9551,7 +9603,11 @@ def process_global(
     print(f"  {'-' * 50}")
 
     prompt = _build_global_prompt(prog_path, address, audit_before)
-    text, meta = _invoke_provider_direct(
+    # H24: route through the subprocess watchdog so a wedged provider call
+    # can't stall the globals worker indefinitely (matches function-worker
+    # path at L7826). invoke_claude → _invoke_provider_with_watchdog has the
+    # same (text, meta) return shape as _invoke_provider_direct.
+    text, meta = invoke_claude(
         prompt,
         model=model,
         max_turns=max_turns,

@@ -109,10 +109,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             "/debugger/attach": lambda: self._handle_attach(body),
             "/debugger/detach": self._handle_detach,
             "/debugger/go": self._handle_go,
+            "/debugger/go_wait": lambda: self._handle_go_wait(body),
+            "/debugger/pass_exceptions": lambda: self._handle_pass_exceptions(body),
             "/debugger/interrupt": self._handle_interrupt,
             "/debugger/step_into": lambda: self._handle_step_into(body),
             "/debugger/step_over": lambda: self._handle_step_over(body),
             "/debugger/breakpoint": lambda: self._handle_set_breakpoint(body),
+            "/debugger/write_memory": lambda: self._handle_write_memory(body),
+            "/debugger/write_registers": lambda: self._handle_write_registers(body),
+            "/debugger/call_function": lambda: self._handle_call_function(body),
             "/debugger/sync_modules": lambda: self._handle_sync_modules(body),
             "/debugger/trace/start": lambda: self._handle_trace_start(body),
             "/debugger/trace/stop": lambda: self._handle_trace_stop(body),
@@ -208,6 +213,63 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         runtime_modules = ds.engine.get_modules()
         result = ds.mapper.update_from_modules(runtime_modules, parsed_bases)
+        self._send_json(result)
+
+    def _handle_write_memory(self, body: dict):
+        ds = self._ds()
+        addr_str = str(body.get("address", ""))
+        data_hex = body.get("data", "")
+        addr_type = body.get("address_type", "runtime")
+        if not addr_str or not data_hex:
+            self._send_error(400, "Missing 'address' or 'data' (hex string)")
+            return
+        address = int(addr_str, 16) if addr_str.startswith("0x") else int(addr_str)
+        if addr_type == "ghidra":
+            address = ds.mapper.to_runtime(address, body.get("module") or None)
+        data = bytes.fromhex(str(data_hex).replace(" ", ""))
+        n = ds.engine.write_memory(address, data)
+        self._send_json({"address": f"0x{address:08X}", "bytes_written": n})
+
+    def _handle_write_registers(self, body: dict):
+        ds = self._ds()
+        regs = body.get("registers", {})
+        if not regs:
+            self._send_error(400, "Missing 'registers' dict")
+            return
+        parsed = {}
+        for name, val in regs.items():
+            if isinstance(val, str):
+                parsed[name] = int(val, 16) if val.startswith("0x") else int(val)
+            else:
+                parsed[name] = int(val)
+        applied = ds.engine.write_registers(parsed)
+        self._send_json({"applied": {k: f"0x{v:08X}" for k, v in applied.items()}})
+
+    def _handle_call_function(self, body: dict):
+        """Call a function in-process (generic x86/WOW64 target). Body:
+        {address | (address+address_type:'ghidra'+module), stack_args:[..],
+         registers:{ecx:..,edx:..,eax:..}, ret_catch?, timeout_ms?}. Values may be
+         ints or 0x-hex strings. App-agnostic: no target-specific assumptions."""
+        def _num(v):
+            if isinstance(v, str):
+                return int(v, 16) if v.lower().startswith("0x") else int(v)
+            return int(v)
+        ds = self._ds()
+        addr = body.get("address")
+        if addr is None:
+            self._send_error(400, "Missing 'address'")
+            return
+        address = _num(addr)
+        if body.get("address_type") == "ghidra":
+            address = ds.mapper.to_runtime(address, body.get("module") or None)
+        ret_catch = body.get("ret_catch")
+        if ret_catch is not None:
+            ret_catch = _num(ret_catch)
+        registers = {k: _num(v) for k, v in (body.get("registers") or {}).items()}
+        stack_args = [_num(a) for a in (body.get("stack_args") or [])]
+        result = ds.engine.call_function(
+            address, stack_args=stack_args, registers=registers,
+            ret_catch=ret_catch, timeout_ms=int(body.get("timeout_ms", 8000)))
         self._send_json(result)
 
     def _handle_address_map(self):
@@ -308,6 +370,17 @@ class RequestHandler(BaseHTTPRequestHandler):
         ds = self._ds()
         result = ds.engine.go_nowait()
         self._send_json(result)
+
+    def _handle_go_wait(self, body: dict):
+        ds = self._ds()
+        timeout_ms = int(body.get("timeout_ms", 4000))
+        result = ds.engine.go_wait(timeout_ms)
+        self._send_json(result)
+
+    def _handle_pass_exceptions(self, body: dict):
+        ds = self._ds()
+        enabled = bool(body.get("enabled", True))
+        self._send_json(ds.engine.set_pass_exceptions(enabled))
 
     def _handle_interrupt(self):
         ds = self._ds()

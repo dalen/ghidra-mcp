@@ -5,14 +5,15 @@ You are a coding agent working on **ghidra-mcp**, a Model Context Protocol serve
 ## Project Context
 
 - **Repo**: https://github.com/bethington/ghidra-mcp
-- **Version**: 5.14.1
+- **Version**: 5.15.0
 - **Language**: Java (Ghidra extension) + Python (MCP bridge)
-- **Key feature**: 251 MCP tools for binary analysis, knowledge database, BSim integration, headless server support, AI documentation workflows
+- **Key feature**: 256 MCP tools for binary analysis, knowledge database, BSim integration, headless server support, AI documentation workflows
 
 ## Directory Structure
 
 - `src/` — Java source for Ghidra extension and headless server
-- `bridge_mcp_ghidra.py` — Python MCP bridge (main entry point)
+- `python/bridge_mcp_ghidra/` — Python MCP bridge package (`bridge-mcp-ghidra` console script / `python -m bridge_mcp_ghidra`)
+- `pyproject.toml` + `uv.lock` — uv project (ships the `ghidra-mcp-bridge` wheel; deps via PEP 735 groups)
 - `docs/` — Documentation and workflow prompts
 - `tests/` — Python unit tests and endpoint catalog
 - `CHANGELOG.md` — Version history
