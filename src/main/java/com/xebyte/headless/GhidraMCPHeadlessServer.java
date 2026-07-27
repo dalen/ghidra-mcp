@@ -54,7 +54,7 @@ import java.util.*;
  */
 public class GhidraMCPHeadlessServer implements GhidraLaunchable {
 
-    private static final String VERSION = "5.15.0-headless";
+    private static final String VERSION = "6.0.0-headless";
     private static final int DEFAULT_PORT = 8089;
     private static final String DEFAULT_BIND_ADDRESS = "127.0.0.1";
 
@@ -410,8 +410,12 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
                         ? JsonHelper.parseBody(exchange.getRequestBody()) : Map.of();
                     sendResponse(exchange, ep.handler().handle(query, body).toJson());
                 } catch (Exception e) {
-                    String msg = e.getMessage() != null ? e.getMessage() : e.toString();
-                    sendResponse(exchange, "{\"error\": \"" + msg.replace("\\", "\\\\").replace("\"", "\\\"") + "\"}");
+                    // Uncaught handler failure: log full detail, return generic
+                    // (avoid leaking paths/class names to the client).
+                    ghidra.util.Msg.error(GhidraMCPHeadlessServer.class,
+                        "Unhandled error on " + ep.path(), e);
+                    sendResponse(exchange,
+                        "{\"error\": \"Internal server error. See the Ghidra application log for details.\"}");
                 }
             });
         }
@@ -683,6 +687,19 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
         return server.createContext(path, exchange -> {
             if (!isAuthExempt(path)) {
                 com.xebyte.core.SecurityConfig sec = com.xebyte.core.SecurityConfig.getInstance();
+                // Anti-CSRF / DNS-rebinding guard (no-op once a token is set).
+                String crossOriginError = sec.rejectCrossOriginRequest(
+                        exchange.getRequestHeaders().getFirst("Host"),
+                        exchange.getRequestHeaders().getFirst("Origin"));
+                if (crossOriginError != null) {
+                    byte[] body = ("{\"error\": \"" + crossOriginError + "\"}").getBytes(StandardCharsets.UTF_8);
+                    exchange.getResponseHeaders().set("Content-Type", "application/json");
+                    exchange.sendResponseHeaders(403, body.length);
+                    try (OutputStream os = exchange.getResponseBody()) {
+                        os.write(body);
+                    }
+                    return;
+                }
                 if (sec.isAuthEnabled()) {
                     String authHeader = exchange.getRequestHeaders().getFirst("Authorization");
                     if (!sec.matchesBearerAuth(authHeader)) {
@@ -762,6 +779,10 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
             String line;
             while ((line = reader.readLine()) != null) {
                 sb.append(line);
+                // Bound accumulation so a huge body can't exhaust memory.
+                if (sb.length() > com.xebyte.core.SecurityConfig.MAX_REQUEST_BODY_BYTES) {
+                    return params;  // oversized — treat as no params
+                }
             }
             body = sb.toString();
         }

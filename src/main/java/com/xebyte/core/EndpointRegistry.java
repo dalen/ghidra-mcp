@@ -619,6 +619,14 @@ public class EndpointRegistry {
             params(qStr("address", "Function address"), pProg()),
             (q, b) -> commentService.getPlateComment(str(q, "address"), str(q, "program")));
 
+        get("/get_comment", "Get listing comments (plate/pre/eol/post) at any address, including data",
+            params(qStr("address", "Address (data or code)"), pProg()),
+            (q, b) -> commentService.getComment(str(q, "address"), str(q, "program")));
+
+        post("/set_comment", "Set a listing comment (plate/pre/eol/post/repeatable) at any address, including data",
+            params(bStr("address"), bStr("comment"), bStrOpt("type"), pProg()),
+            (q, b) -> commentService.setComment(bodyStr(b, "address"), bodyStr(b, "comment"), bodyStr(b, "type"), str(q, "program")));
+
         post("/set_plate_comment", "Set function header/plate comment",
             params(bStr("address"), bStr("comment"), pProg()),
             (q, b) -> commentService.setPlateComment(bodyStr(b, "address"), bodyStr(b, "comment"), str(q, "program")));
@@ -899,9 +907,9 @@ public class EndpointRegistry {
             params(bStr("struct_name"), bStr("field_name"), pProg()),
             (q, b) -> dataTypeService.removeStructField(bodyStr(b, "struct_name"), bodyStr(b, "field_name"), str(q, "program")));
 
-        post("/import_data_types", "Import data types from C source",
-            params(bStr("source"), bStr("format")),
-            (q, b) -> dataTypeService.importDataTypes(bodyStr(b, "source"), bodyStr(b, "format", "c")));
+        post("/import_data_types", "Parse C source into the program's data type manager (CParser)",
+            params(bStr("source"), bStr("format"), pProg()),
+            (q, b) -> dataTypeService.importDataTypes(bodyStr(b, "source"), bodyStr(b, "format", "c"), str(q, "program")));
 
         post("/create_data_type_category", "Create a new data type category",
             params(bStr("category_path"), pProg()),
@@ -1193,9 +1201,11 @@ public class EndpointRegistry {
             params(qStr("path", "Program path in project"), qBool("auto_analyze", false, "Run auto-analysis")),
             (q, b) -> programScriptService.openProgramFromProject(str(q, "path"), bool(q, "auto_analyze")));
 
-        post("/run_script", "Execute a Ghidra script by path",
-            params(bStr("script_path"), bStrOpt("args"), pProg()),
-            (q, b) -> programScriptService.runGhidraScript(bodyStr(b, "script_path"), bodyStr(b, "args"), str(q, "program")));
+        // NOTE: /run_script (raw runGhidraScript by path) is intentionally NOT
+        // registered. Use /run_ghidra_script (output capture + timeout), which
+        // enforces the GHIDRA_MCP_ALLOW_SCRIPTS gate. runGhidraScript itself now
+        // also enforces the gate at the sink, so re-adding this route would not
+        // reintroduce an ungated RCE — but keep it unregistered regardless.
 
         post("/run_script_inline", "Execute inline Ghidra script code",
               params(bStr("code"), bStrOpt("args"), pProg()),

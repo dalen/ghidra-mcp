@@ -41,6 +41,30 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 FUN_DOC_DIR = SCRIPT_DIR.parent
 REPO_ROOT = FUN_DOC_DIR.parent
 
+
+def _redact_dsn(url: str) -> str:
+    """Mask the password in a ``postgresql://user:pw@host/db`` URL so it never
+    lands in terminal history / CI logs. sqlite and passwordless URLs pass
+    through unchanged."""
+    if not isinstance(url, str) or "://" not in url:
+        return url
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+
+        parts = urlsplit(url)
+        if parts.password is None:
+            return url
+        netloc = parts.hostname or ""
+        if parts.port:
+            netloc = f"{netloc}:{parts.port}"
+        if parts.username:
+            netloc = f"{parts.username}:***@{netloc}"
+        return urlunsplit(
+            (parts.scheme, netloc, parts.path, parts.query, parts.fragment)
+        )
+    except Exception:
+        return "<redacted-dsn>"
+
 # Default smoke DB location. /c/tmp on Windows MSYS, /tmp elsewhere.
 if sys.platform == "win32":
     DEFAULT_SMOKE_DB_PATH = Path(r"C:\tmp\v58-smoke.db")
@@ -250,30 +274,32 @@ def cmd_prep(args) -> int:
     target = args.binary or "<your-binary>"
     # The v5.8 storage factory reads exactly one env var: FUN_DOC_DB_URL.
     # Backend is inferred from the URL scheme (sqlite: vs postgresql:).
+    shown_url = _redact_dsn(url)
+    if shown_url != url:
+        print("  # NOTE: the DB password below is masked as *** — substitute your own.")
     if sys.platform == "win32":
         print("  # 1. Set the backend URL in this shell (PowerShell):")
-        print(f"  $env:FUN_DOC_DB_URL = '{url}'")
+        print(f"  $env:FUN_DOC_DB_URL = '{shown_url}'")
         print()
         print("  # or in bash:")
-        print(f"  export FUN_DOC_DB_URL='{url}'")
+        print(f"  export FUN_DOC_DB_URL='{shown_url}'")
     else:
         print("  # 1. Set the backend URL in this shell:")
-        print(f"  export FUN_DOC_DB_URL='{url}'")
+        print(f"  export FUN_DOC_DB_URL='{shown_url}'")
     print()
     print(f"  # 2. Start the dashboard (from the worktree dir, NOT main):")
     print(f"  cd {REPO_ROOT}")
     print(f"  python fun-doc/fun_doc.py --web --web-port 5000")
     print()
-    print(f"  # 3. Open http://127.0.0.1:5000 — confirm:")
-    print(f"     - function inventory renders with the migrated counts")
-    print(f"     - sessions panel shows historical sessions")
+    print(f"  # 3. Open http://127.0.0.1:5000 (pipeline dashboard) — confirm:")
+    print(f"     - Function Inventory renders with the migrated counts")
+    print(f"     - completion bars populate (no stale SAMPLE fallback data)")
     print(f"     - no 'state.json not found' or 'table doesn't exist' errors")
     print()
-    print(f"  # 4. Spawn ONE worker on {target}:")
-    print(f"     - Count: 3 (BH.dll) or 10 (D2Multi.dll)")
-    print(f"     - Mode: functions")
+    print(f"  # 4. Spawn ONE worker on {target} (focus it via the binary picker):")
+    print(f"     - Lane: Document, Count: 3 (BH.dll) or 10 (D2Multi.dll)")
     print(f"     - Provider: minimax")
-    print(f"     - Continuous: false")
+    print(f"     - All: unchecked")
     print()
     print(f"  # 5. While it runs, monitor with:")
     print(f"     python {Path(__file__).name} check")

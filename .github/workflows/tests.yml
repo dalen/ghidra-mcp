@@ -22,10 +22,10 @@ jobs:
         java-version: [ '21' ]
 
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4
 
     - name: Set up Java
-      uses: actions/setup-java@ad2b38190b15e4d6bdf0c97fb4fca8412226d287  # v5.3.0
+      uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95  # v5.6.0
       with:
         java-version: ${{ matrix.java-version }}
         distribution: 'temurin'
@@ -108,7 +108,13 @@ jobs:
         # server. The true integration tests (GhidraMCPPluginTest,
         # EndpointRegistrationTest, AppTest) require a running Ghidra instance and are
         # excluded from this run.
-        mvn -q test -Dtest='com.xebyte.offline.*Test'
+        #
+        # com.xebyte.core is included too: those are Mockito/ProgramBuilder tests
+        # that need no server either, and they cover the no-return + flow-repair
+        # behavior (#384/#385). Matching only com.xebyte.offline meant they never
+        # ran in CI at all. The one ProgramBuilder suite self-skips via assumeTrue
+        # when GHIDRA_INSTALL_DIR is unset, which is the case here.
+        mvn -q test -Pcoverage-gate -Dtest='com.xebyte.offline.*Test,com.xebyte.core.*Test'
 
     - name: Verify build artifacts
       run: |
@@ -124,8 +130,9 @@ jobs:
         path: target/surefire-reports/
 
     - name: Upload JaCoCo coverage report
-      # First-ever Java coverage baseline (offline tier only). Baseline, not a
-      # gate — inspect target/site/jacoco/index.html from the artifact.
+      # Offline-tier Java coverage. The -Pcoverage-gate profile on the test step
+      # above enforces the ratchet (pom.xml); this artifact is for inspecting
+      # where the gaps are — open target/site/jacoco/index.html.
       if: always()
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
       with:
@@ -151,10 +158,10 @@ jobs:
         python-version: [ '3.10', '3.11', '3.12', '3.13' ]
 
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4
 
     - name: Install uv
-      uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
       with:
         enable-cache: true
 
@@ -167,10 +174,11 @@ jobs:
         # uv installs the bridge package (editable) + test group from the lock.
         # Coverage sources (bridge_mcp_ghidra, tools, debugger) come from the
         # addopts in pyproject.toml. The fail-under floor is a RATCHET: it sits
-        # a few points below the measured baseline (51% on 2026-07-03) to absorb
+        # a few points below the measured baseline (61% on 2026-07-24, after
+        # static_tools.py and debugger/tracing.py went to 100%) to absorb
         # platform/version skew — raise it as coverage improves, never lower it.
         uv run --python ${{ matrix.python-version }} --group test \
-          pytest tests/unit/ -v --tb=short --cov-fail-under=46
+          pytest tests/unit/ -v --tb=short --cov-fail-under=58
 
     - name: Upload coverage
       if: ${{ always() && hashFiles('coverage.xml', 'tests/coverage.xml') != '' }}
@@ -189,10 +197,10 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4
 
     - name: Install uv
-      uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
       with:
         enable-cache: true
 
@@ -200,7 +208,7 @@ jobs:
       # A unit test shells out to `gradlew deploy --dry-run`, which needs a Java
       # 21 toolchain; windows-latest doesn't provide one Gradle can auto-detect
       # (the ubuntu runner ships JAVA_HOME_21 by default, Windows does not).
-      uses: actions/setup-java@ad2b38190b15e4d6bdf0c97fb4fca8412226d287  # v5.3.0
+      uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95  # v5.6.0
       with:
         java-version: '21'
         distribution: 'temurin'
@@ -219,10 +227,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4
 
     - name: Install uv
-      uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
       with:
         enable-cache: true
 
@@ -249,7 +257,16 @@ jobs:
         # The fail-under floor is a RATCHET: measured baseline was 29% on
         # 2026-07-03 with these exclusions — raise it as fun_doc.py/web.py
         # subsystems get extracted and tested, never lower it.
-        $UV_RUN python -m pytest tests/performance/ -q --cov=fun-doc --cov-fail-under=26 \
+        # The denominator excludes vendored code and live-only one-shot
+        # operational scripts via [tool.coverage.run] omit in pyproject.toml
+        # (re-measured 31.85% on 2026-07-24, after the worker quota-pause tests
+        # and pruning six live-only diagnostic CLIs from the denominator)
+        # — see the policy comment there before adding entries.
+        # NOTE when re-measuring: this job's denominator is NOT fun-doc alone.
+        # pyproject's addopts add --cov=bridge_mcp_ghidra/tools/debugger on top
+        # of the --cov=fun-doc below, and those are largely unexercised here, so
+        # a local run with `-o addopts=""` reads several points HIGHER than CI.
+        $UV_RUN python -m pytest tests/performance/ -q --cov=fun-doc --cov-fail-under=30 \
           --ignore=tests/performance/test_batch_scoring_consistency.py \
           --ignore=tests/performance/test_health_endpoint.py \
           --ignore=tests/performance/test_http_concurrency.py \
@@ -277,10 +294,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4
 
     - name: Install uv
-      uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
       with:
         enable-cache: true
 
@@ -297,10 +314,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4
 
     - name: Lint markdown
-      uses: DavidAnson/markdownlint-cli2-action@05f32210e84442804257b2a6f20b273450ec8265  # v19
+      uses: DavidAnson/markdownlint-cli2-action@6bf21b07787794f89a243495939cd651942aeabe  # v24.1.0
       with:
         globs: '**/*.md'
         config: '.markdownlintrc'
@@ -311,7 +328,7 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4
 
     - name: Run Pester suite
       shell: powershell

@@ -2,9 +2,9 @@
 
 ## Overview
 
-MCP server bridging Ghidra reverse engineering with AI tools. 256 MCP tools for binary analysis.
+MCP server bridging Ghidra reverse engineering with AI tools. 272 MCP tools for binary analysis.
 
-- **Package**: `com.xebyte` | **Version**: 5.15.0 | **Java**: 21 LTS | **Ghidra**: 12.1.2
+- **Package**: `com.xebyte` | **Version**: 6.0.0 | **Java**: 21 LTS | **Ghidra**: 12.1.2
 
 ## Boil the ocean
 
@@ -21,7 +21,8 @@ This is a public repo with real external contributors. Their issues, PRs, and co
 - **To use a contributor's work, merge their PR through the normal flow** (which credits them) — never extract the commit around them or push it to `main` directly.
 - **Never post AI-generated text as if it were Ben's own analysis**, and never post a claim about someone else's work without verifying it against the code first.
 - When Ben asks for a reply to a contributor, produce a short draft *for him to send in his own words* — do not post it, and do not make it sound machine-generated.
-- A local `.claude/` hook (`block-community-github-writes.py`) enforces a slice of this by denying write-shaped `gh` commands; treat that as a backstop, not the boundary. The boundary is this section.
+- **Exception: `dependabot[bot]` PRs.** These are the repo's own configured automation, not community contributions — no person's work is at stake. The agent may comment (e.g. `@dependabot rebase`/`recreate`) and merge these autonomously once CI is green, without per-action go-ahead. This exception is scoped to PRs whose author is literally `dependabot[bot]`; it does not extend to any human contributor, even one proposing a similar dependency bump.
+- A local `.claude/` hook (`block-community-github-writes.py`) enforces a slice of this by denying write-shaped `gh` commands (checking PR authorship to carve out the dependabot exception above); treat that as a backstop, not the boundary. The boundary is this section.
 
 ## Architecture
 
@@ -34,7 +35,7 @@ AI Tools <-> MCP Bridge (python/bridge_mcp_ghidra/) <-> Ghidra Plugin (GhidraMCP
 - **Service Layer**: `src/main/java/com/xebyte/core/` -- 14 service classes (~20K lines), `@McpTool`/`@Param` annotated. v5.4.0 adds `EmulationService` (P-code emulation), `DebuggerService` (TraceRmi wrapping — GUI-only)
 - **Debugger (Python)**: `debugger/` -- standalone HTTP server on port 8099 (engine, protocol, tracing, address_map, d2/ conventions). Bridge proxies via `GHIDRA_DEBUGGER_URL` env var.
 - **Headless**: `src/main/java/com/xebyte/headless/` -- standalone server without GUI. Includes `HeadlessManagementService` for program/project lifecycle.
-- **fun-doc**: `fun-doc/` -- AI-driven function documentation workflow (separate from MCP tools). `fun_doc.py` (~9,800 lines) manages a priority queue of functions, routes LLM scoring, and persists per-function workflow state, run history, and inventories to a SQL store via `fun-doc/storage/` (SQLAlchemy Core abstraction; SQLite default at `fun-doc/state.db`, Postgres opt-in via `FUN_DOC_DB_URL` or `priority_queue.json -> config.storage`). The `fun_doc` Postgres schema is sibling to `re_kb` in the same `bsim` instance — see [RE-Universe](https://github.com/bethington/re-universe) for the published API. Migration tooling lives in `fun-doc/scripts/migrate_state_to_sql.py` + `verify_migration.py` (zero-diff gate); see `~/.claude/plans/fun-doc-postgres-storage-migration.md` for the design. `web.py` is the web dashboard. Sibling modules: `inventory_scorer.py` (idle-time daemon filling missing completeness scores; persists to `fun_doc.inventory`) and `provider_pause.py` (per-(provider, model) quota-wall detector backed by `fun-doc/provider_pauses.json`). Workers freeze a config snapshot at start so live edits don't affect running workers. Legacy `state.json` is read only as a fallback when the SQL backend can't be loaded. Not exposed as MCP tools — internal curation subsystem. See `tests/performance/test_state_atomicity.py` (legacy fallback) and `test_storage_*.py` (SQL backend) for regression coverage.
+- **fun-doc**: `fun-doc/` -- AI-driven function documentation workflow (separate from MCP tools). `fun_doc.py` (~14,000 lines) manages a priority queue of functions, routes LLM scoring, and persists per-function workflow state, run history, and inventories to a SQL store via `fun-doc/storage/` (SQLAlchemy Core abstraction; SQLite default at `fun-doc/state.db`, Postgres opt-in via `FUN_DOC_DB_URL` or `priority_queue.json -> config.storage`). The `fun_doc` Postgres schema is sibling to `re_kb` in the same `bsim` instance — see [RE-Universe](https://github.com/bethington/re-universe) for the published API. Migration tooling lives in `fun-doc/scripts/migrate_state_to_sql.py` + `verify_migration.py` (zero-diff gate); see `~/.claude/plans/fun-doc-postgres-storage-migration.md` for the design. `web.py` is the web dashboard. Sibling modules: `inventory_scorer.py` (idle-time daemon filling missing completeness scores; persists to `fun_doc.inventory`) and `provider_pause.py` (per-(provider, model) quota-wall + terminal-failure detector backed by `fun-doc/provider_pauses.json`; readers re-read that file on change, since the pause is installed by the provider subprocess but consulted by the dashboard's worker loop). Workers freeze a config snapshot at start so live edits don't affect running workers. Legacy `state.json` is read only as a fallback when the SQL backend can't be loaded. Not exposed as MCP tools — internal curation subsystem. See `tests/performance/test_state_atomicity.py` (legacy fallback) and `test_storage_*.py` (SQL backend) for regression coverage.
 - **Annotation Scanner**: `AnnotationScanner.java` discovers `@McpTool` methods, generates `/mcp/schema`
 
 Services use constructor injection: `ProgramProvider` + `ThreadingStrategy`.
@@ -45,7 +46,7 @@ Services use constructor injection: `ProgramProvider` + `ThreadingStrategy`.
 
 Do not try to keep the full tool list in this file.
 
-- **Authoritative repo snapshot**: `tests/endpoints.json` (251 endpoints, categories, descriptions)
+- **Authoritative repo snapshot**: `tests/endpoints.json` (272 endpoints, categories, descriptions)
 - **Authoritative runtime schema**: `/mcp/schema` from the running server
 - **Usage patterns / operator guide**: `docs/prompts/TOOL_USAGE_GUIDE.md`
 
@@ -107,8 +108,9 @@ state when modal dialogs may be present.
 ## Running the MCP Server
 
 ```bash
-uv run bridge-mcp-ghidra                       # stdio (recommended for AI tools)
-uv run bridge-mcp-ghidra --transport sse       # SSE (web/HTTP clients)
+uv run bridge-mcp-ghidra                                  # stdio (recommended for AI tools)
+uv run bridge-mcp-ghidra --transport streamable-http      # HTTP (web clients, MCP Inspector)
+uv run bridge-mcp-ghidra --transport sse                  # SSE (deprecated compat only)
 uv run python -m bridge_mcp_ghidra             # equivalent module form
 uv sync --group debugger                       # optional debugger deps
 uv run python -m debugger                      # standalone debugger server on :8099
@@ -175,12 +177,16 @@ Find the file(s) you edited below; run everything in that row. Always include th
 | `src/main/java/com/xebyte/headless/*` | Offline (Java) + `tests/unit/test_setup_ghidra.py` + Integration (Java) headless run |
 | `python/bridge_mcp_ghidra/*` (bridge package) | `tests/unit/test_bridge_utils.py tests/unit/test_mcp_tools.py tests/unit/test_mcp_tool_functions.py tests/unit/test_response_schemas.py tests/unit/test_endpoint_catalog.py tests/unit/test_project_consistency.py`. For multi-candidate socket dir scan (#170): `TestGetSocketDirCandidates` + `TestDiscoverInstancesMultiDir`. For TCP port-range scanner (#175): `TestTcpPortScan`. For debugger-tool platform gating: `TestDebuggerEnabled` + `TestDebuggerToolRegistration`. Per-module size cap is 800 lines (`test_bridge_modules_stay_focused`). Mock-patch targets are module-qualified (e.g. `bridge_mcp_ghidra.dispatch.dispatch_get`, `bridge_mcp_ghidra.transport.do_request`); mutable globals live in `bridge_mcp_ghidra.state`. |
 | `fun-doc/library_code_detector.py` — heuristic library-code classifier | `tests/performance/test_library_code_detector.py` (19-case unit suite) + `tests/performance/test_selector_invariants.py` (3 selector-skip cases). Live spot-check on a binary known to contain CRT/STL (e.g. anything compiled with MSVC `/MT`): confirm functions like `ParseSignedShort` classify but real user code (e.g. exported APIs) does not. |
-| `fun-doc/fun_doc.py` — state, sessions, locking, selector, scoring | `tests/performance/test_state_atomicity.py tests/performance/test_state_lock_reentrant.py tests/performance/test_selector_invariants.py tests/performance/test_event_bus_drain.py` + fun-doc benchmark (`--mock --tier fast --compare`) |
+| `fun-doc/fun_doc.py` — state, sessions, locking, selector, scoring | `tests/performance/test_state_atomicity.py tests/performance/test_state_lock_reentrant.py tests/performance/test_selector_invariants.py tests/performance/test_event_bus_drain.py tests/performance/test_context_meta_writes.py` + fun-doc benchmark (`--mock --tier fast --compare`) |
+| `fun-doc/fun_doc.py` `set_state_meta`/`get_state_meta`/`load_state(binary_name=)`, `fun-doc/storage/repository.py` bulk upsert, or the `web.py` `/api/context/*` routes | `tests/performance/test_context_meta_writes.py tests/performance/test_storage_common.py`. Context switches must stay meta-only — routing them through `save_state()` bulk-upserts all ~62K workflow rows (~50 s measured 2026-07-09; that was the dashboard's binary-switch stall). |
 | `fun-doc/fun_doc.py` — provider routing, prompt construction | `tests/performance/test_provider_selection.py tests/performance/test_ghidra_offline.py tests/performance/test_globals_worker.py` + fun-doc benchmark |
 | `fun-doc/web.py` — worker loop, heartbeats, dashboard | `tests/performance/test_state_atomicity.py tests/performance/test_worker_watchdog.py tests/performance/test_dashboard_single_instance.py tests/performance/test_worker_config_snapshot.py` |
 | `fun-doc/inventory_scorer.py` | `tests/performance/test_inventory_scorer.py` |
 | `fun-doc/provider_pause.py` | `tests/performance/test_provider_pause.py` |
 | `fun-doc/event_bus.py` / `event_log.py` | `tests/performance/test_event_bus_drain.py` |
+| `fun-doc/port_pipeline.py` — OpenD2 conformance port pipeline (Sec 14 of `EMULATION_CONFORMANCE_PLAN.md`: classify/mint_vectors/write_draft/run_harness/select_port_candidates/prompt builders) | `tests/performance/test_port_pipeline.py` (offline — classify_function heuristic, selector, prompt round-trip, template rendering). `mint_vectors`/`run_harness` (live Ghidra `/emulate_function` + CMake build of the isolated `d2conform_draft` target) and `process_port_candidate`/`run_port_worker_pass` (live LLM calls) are manual-only — see the module docstring. After changing the `_DRAFT_RUNNER_TEMPLATE` or CMake wiring, manually rebuild `Tools/d2conform` with `-DD2CONFORM_ENABLE_DRAFTS=ON` in an isolated build dir (never `build_allegro`) and confirm a throwaway candidate still passes/fails correctly — do not trust the template renders correctly from reading it. |
+| `scripts/gen_conformance_protected.py` | Manual: `python -m scripts.gen_conformance_protected` (dry-run) against a live Ghidra instance with the PD2-S12 programs loaded; diff against the committed `conformance_protected.json` before `--apply`. Scoped to the `/Mods/PD2-S12/` path prefix, not `instance_info`'s `open` flag — that flag does not reliably indicate whether a program is queryable via `/search_functions_by_tag`. |
+| `fun-doc/web.py` — `/api/conformance/pipeline`, `/api/conformance/draft_content`, or the Conformance tab's "Port Pipeline" panel in `templates/dashboard.html` | `python fun-doc/workbench_selftest.py` (Flask test client — no live server needed; checks 4-6 exercise the pipeline/draft-content routes including the path-escape rejection, and self-skip with a note if no `proven_pending_review` candidate is currently staged). Fields read from `functions_workflow` must be listed in BOTH `fun_doc._STATE_DIRECT_FIELDS` (gates `_state_func_to_row`) AND `storage.repository._UPDATABLE_WORKFLOW_FIELDS` — missing either one silently drops the field on `update_function_state()` with no exception (confirmed live: this exact gap silently no-op'd `port_status` persistence). |
 | `fun-doc/audit/*` | `tests/performance/test_audit_rules.py tests/performance/test_audit_registry.py` |
 | `fun-doc/benchmark/scorer.py` or `truth/*.yaml` or `src/*.c` | `tests/performance/test_benchmark_scorer.py tests/performance/test_benchmark_extract_truth.py tests/performance/test_benchmark_haiku_judge.py tests/performance/test_benchmark_ghidra_bridge.py` + rerun the benchmark itself |
 | `debugger/*` | `tests/unit/test_address_map.py tests/unit/test_d2_conventions.py tests/unit/test_debugger_engine.py tests/unit/test_debugger_server.py tests/unit/test_windbg.py` |
@@ -207,8 +213,13 @@ mvn test -Dtest='com.xebyte.offline.*Test'
 
 **Offline Python (no Ghidra needed — the whole performance/ dir minus 4 integration-flavored files):**
 
+Run these through `uv run --group fun-doc`. Without that group `fun_doc.py`
+calls `sys.exit(1)` on its missing SQLAlchemy import, which surfaces as a
+pytest INTERNALERROR **during collection** — zero tests run and the failure
+looks nothing like a missing dependency.
+
 ```text
-pytest tests/performance/ \
+uv run --group fun-doc python -m pytest tests/performance/ \
   --ignore=tests/performance/test_batch_scoring_consistency.py \
   --ignore=tests/performance/test_health_endpoint.py \
   --ignore=tests/performance/test_http_concurrency.py \
@@ -304,9 +315,9 @@ After a worker documents a function, a different provider re-examines the result
 
 When enabled, every run writes an `audit_outcome` field into `logs/runs.jsonl` (`improved` / `regressed` / `no_change` / `skipped_good` / `skipped_delta`). The dashboard's "Audit:" line under run stats renders the aggregate. Current default pairing: **minimax** does the primary doc pass, **gemini** does audits (complementary family per model-routing memory).
 
-## Cross-version doc archive (re-kb on bsim Postgres)
+## Cross-version doc archive (optional re-kb service)
 
-Stored at `re_kb.functions` on the bsim Postgres at `10.0.10.30:5432`. Exposed via the re-kb FastAPI service at `http://10.0.10.30:8422`. Source: `re-universe/services/re-kb/`. The system has six pieces:
+When explicitly configured, documentation is stored in `re_kb.functions` on a user-selected Postgres instance and exposed through a user-selected re-kb FastAPI service. Source: `re-universe/services/re-kb/`. The system has six pieces:
 
 1. **Schema** — `re_kb.functions` augmented with matching keys (`opcode_hash`, `bsim_signature LSHVECTOR`, shape stats), full doc payload (`locals`, `instruction_comments`, `referenced_data_types`, `referenced_globals`, `referenced_labels`, `equates_referenced` JSONB), and metadata. Companion tables: `doc_field_provenance` (per-field decision history), `doc_conflict_queue` (AI judge backlog), `doc_match_log` (lookup audit).
 2. **REST API** (5 endpoints) — `POST /v1/doc_archive/upsert`, `POST /v1/doc_archive/match`, `GET /v1/doc_archive/{id}/full`, `GET /v1/doc_archive/conflicts`, `POST /v1/doc_archive/conflicts/{id}/resolve`.
@@ -315,7 +326,7 @@ Stored at `re_kb.functions` on the bsim Postgres at `10.0.10.30:5432`. Exposed v
 5. **fun-doc hooks** — write hook in `process_function` after `save_program` calls `/archive_ingest_function`. Read hook before LLM checks `/v1/doc_archive/match`; on Q5-D gate pass (hash exact OR `BSim ≥0.9 AND score ≥80`), applies name + plate via existing MCP tools and skips LLM. `bus_emit("archive_pushed"|"archive_lookup"|"archive_applied"|"archive_apply_failed"|"archive_push_failed")` for dashboard visibility.
 6. **AI conflict worker** — `re-kb-conflict-worker` docker container, polls `/v1/doc_archive/conflicts`, asks Claude Haiku for structured JSON decisions, POSTs back. Idle when queue empty.
 
-Q1-Q6 design decisions are locked in; design rationale lives in commit history. Migration `003_function_doc_archive.sql` applied to bsim DB. Required env: `RE_KB_ARCHIVE_URL` (defaults to `http://10.0.10.30:8422`); empty disables both hooks.
+Q1-Q6 design decisions are locked in; design rationale lives in commit history. Migration `003_function_doc_archive.sql` applies to the selected BSim database. Archive exchange is disabled by default; set `RE_KB_ARCHIVE_URL` for fun-doc and `GHIDRA_MCP_ARCHIVE_URL` for the Java service to opt in.
 
 **BSim signature backfill** is a one-shot Ghidra script — `C:\tmp\ghidra_recovery_scripts\Backfill_BSimSignatures.java` — run per binary from CodeBrowser to populate the `bsim_signature` column and unlock tier-2 LSH similarity matching. Tier 1 (opcode hash) works without it.
 

@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
 import pytest
+import tools.setup.ghidra as ghidra_setup
 
 from tools.setup.ghidra import (
     DEFAULT_MCP_URL,
     PLUGIN_CLASS,
     REQUIRED_GHIDRA_JARS,
+    _file_sha256,
     _has_dependency_group,
     collect_preflight_issues,
+    install_ghidra_dependencies,
     find_plugin_archive,
     mark_extension_known_in_tool_config,
     patch_codebrowser_tcd,
@@ -24,8 +28,92 @@ from tools.setup.ghidra import (
     run_default_smoke_test,
     run_endpoint_catalog_test,
     run_selected_endpoint_contract_test,
+    start_ghidra,
 )
 from tools.setup.versioning import VersionInfo
+
+
+class _FakeCompleted:
+    def __init__(self, returncode: int = 0) -> None:
+        self.returncode = returncode
+
+
+class TestInstallGhidraDependenciesRefresh:
+    """`install_ghidra_dependencies` must refresh a cached jar whose content
+    drifted from the install's jar, not just skip on version-string presence.
+
+    Regression: a stale test-scoped DB.jar (a Ghidra re-release rebuilt the jar
+    under the same 12.1.2 version) stayed cached in m2, breaking the offline
+    Java suite until the cache was manually refreshed.
+    """
+
+    def _make_install(self, ghidra_path: Path, content: bytes = b"NEW") -> None:
+        for _artifact_id, relative_path in REQUIRED_GHIDRA_JARS:
+            jar = ghidra_path / relative_path
+            jar.parent.mkdir(parents=True, exist_ok=True)
+            jar.write_bytes(content + b" " + relative_path.encode())
+
+    def _cached_jar(self, home: Path, artifact_id: str, version: str) -> Path:
+        return (
+            home / ".m2" / "repository" / "ghidra" / artifact_id / version
+            / f"{artifact_id}-{version}.jar"
+        )
+
+    def test_refreshes_stale_and_skips_identical(self, tmp_path, monkeypatch):
+        version = "12.1.2"
+        ghidra_path = tmp_path / "ghidra_12.1.2_PUBLIC"
+        home = tmp_path / "home"
+        self._make_install(ghidra_path)
+
+        # Pre-seed m2: one artifact identical to the install (should skip),
+        # one artifact stale (should refresh).
+        skip_id, skip_rel = REQUIRED_GHIDRA_JARS[0]
+        stale_id, _stale_rel = REQUIRED_GHIDRA_JARS[1]
+        identical = self._cached_jar(home, skip_id, version)
+        identical.parent.mkdir(parents=True, exist_ok=True)
+        identical.write_bytes((ghidra_path / skip_rel).read_bytes())  # byte-identical
+        stale = self._cached_jar(home, stale_id, version)
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_bytes(b"STALE OLD BUILD")
+
+        installed: list[str] = []
+
+        def fake_run(command, **kwargs):
+            for token in command:
+                if str(token).startswith("-DartifactId="):
+                    installed.append(str(token).split("=", 1)[1])
+            return _FakeCompleted(0)
+
+        monkeypatch.setattr("tools.setup.ghidra.find_maven_command", lambda: "mvn")
+        monkeypatch.setattr(
+            "tools.setup.ghidra.read_pom_versions",
+            lambda _root: VersionInfo(project_version="5.16.0", ghidra_version=version),
+        )
+        monkeypatch.setattr(
+            "tools.setup.ghidra.install_ghidratrace_for_debugger",
+            lambda *a, **k: 0,
+        )
+        monkeypatch.setattr("tools.setup.ghidra.subprocess.run", fake_run)
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+        rc = install_ghidra_dependencies(tmp_path, ghidra_path)
+
+        assert rc == 0
+        # Identical cache skipped; stale cache refreshed.
+        assert skip_id not in installed, f"{skip_id} should have been skipped"
+        assert stale_id in installed, f"{stale_id} should have been refreshed"
+        # Every artifact with no cache at all is installed.
+        for artifact_id, _rel in REQUIRED_GHIDRA_JARS[2:]:
+            assert artifact_id in installed
+
+
+def test_file_sha256_matches_hashlib(tmp_path: Path):
+    import hashlib
+
+    blob = tmp_path / "x.jar"
+    payload = b"ghidra-jar-bytes" * 4096
+    blob.write_bytes(payload)
+    assert _file_sha256(blob) == hashlib.sha256(payload).hexdigest()
 
 
 def test_patch_frontend_tool_config_adds_plugin_to_self_closing_utility_block():
@@ -320,7 +408,7 @@ def _stub_version(
 
 
 class TestFindPluginArchive:
-    def test_prefers_gradle_output_over_maven(
+    def test_prefers_newest_exact_version_archive(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         _stub_version(monkeypatch, tmp_path)
@@ -330,8 +418,10 @@ class TestFindPluginArchive:
         maven_zip.parent.mkdir(parents=True)
         gradle_zip.write_bytes(b"gradle")
         maven_zip.write_bytes(b"maven")
+        os.utime(gradle_zip, (100, 100))
+        os.utime(maven_zip, (200, 200))
 
-        assert find_plugin_archive(tmp_path) == gradle_zip
+        assert find_plugin_archive(tmp_path) == maven_zip
 
     def test_falls_back_to_maven_target_when_gradle_absent(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -361,6 +451,84 @@ class TestFindPluginArchive:
 
         with pytest.raises(FileNotFoundError, match="build/distributions"):
             find_plugin_archive(tmp_path)
+
+
+def test_start_ghidra_detaches_from_parent_session_on_posix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    ghidra_path = tmp_path / "ghidra_12.1_PUBLIC"
+    ghidra_path.mkdir()
+    launcher = ghidra_path / "ghidraRun"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    recorded: dict = {}
+
+    monkeypatch.setattr(ghidra_setup.os, "name", "posix")
+    monkeypatch.setattr(
+        ghidra_setup.subprocess,
+        "Popen",
+        lambda command, **kwargs: recorded.update(
+            {"command": command, "kwargs": kwargs}
+        ),
+    )
+
+    # Pass repo_root so start_ghidra() doesn't fall back to Path.cwd(): with
+    # os.name monkeypatched to a non-"nt" value, pathlib.Path.cwd() would try to
+    # instantiate a PosixPath and raise on a Windows host. (Matches the Windows
+    # test below, which already passes repo_root.)
+    assert start_ghidra(ghidra_path, repo_root=tmp_path) == 0
+    assert recorded["command"] == [str(launcher)]
+    assert recorded["kwargs"]["start_new_session"] is True
+
+
+def test_start_ghidra_does_not_detach_on_non_posix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    ghidra_path = tmp_path / "ghidra_12.1_PUBLIC"
+    ghidra_path.mkdir()
+    launcher = ghidra_path / "ghidraRun"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    recorded: dict = {}
+
+    monkeypatch.setattr(ghidra_setup.os, "name", "java")
+    monkeypatch.setattr(
+        ghidra_setup.subprocess,
+        "Popen",
+        lambda command, **kwargs: recorded.update(
+            {"command": command, "kwargs": kwargs}
+        ),
+    )
+
+    # Pass repo_root so start_ghidra() doesn't fall back to Path.cwd(): with
+    # os.name monkeypatched to a non-"nt" value, pathlib.Path.cwd() would try to
+    # instantiate a PosixPath and raise on a Windows host. (Matches the Windows
+    # test below, which already passes repo_root.)
+    assert start_ghidra(ghidra_path, repo_root=tmp_path) == 0
+    assert recorded["kwargs"]["start_new_session"] is False
+
+
+def test_start_ghidra_uses_batch_launcher_without_detaching_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    ghidra_path = tmp_path / "ghidra_12.1_PUBLIC"
+    ghidra_path.mkdir()
+    launcher = ghidra_path / "ghidraRun.bat"
+    launcher.write_text("@echo off\n", encoding="utf-8")
+    recorded: dict = {}
+
+    monkeypatch.setattr(ghidra_setup.os, "name", "nt")
+    monkeypatch.setattr(ghidra_setup.sys, "platform", "win32")
+    monkeypatch.setenv("COMSPEC", "cmd-test.exe")
+    monkeypatch.setattr(
+        ghidra_setup.subprocess,
+        "Popen",
+        lambda command, **kwargs: recorded.update(
+            {"command": command, "kwargs": kwargs}
+        ),
+    )
+
+    assert start_ghidra(ghidra_path, repo_root=tmp_path) == 0
+    assert recorded["command"] == ["cmd-test.exe", "/c", str(launcher)]
+    assert recorded["kwargs"]["start_new_session"] is False
 
 
 def test_collect_preflight_issues_passes_with_required_files(

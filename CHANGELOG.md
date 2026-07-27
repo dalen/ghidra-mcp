@@ -4,10 +4,127 @@ Complete version history for the Ghidra MCP Server project.
 
 ---
 
-## Unreleased
+## v6.0.0 - 2026-07-25 (major: security hardening with a breaking default, program storage tools, provider resilience)
+
+> **⚠️ Breaking change.** The HTTP servers now reject cross-origin browser
+> requests and non-loopback `Host` headers when running without
+> `GHIDRA_MCP_AUTH_TOKEN` (see the anti-CSRF / DNS-rebinding guard below). A
+> browser-based client on loopback without a token now receives `403`. The MCP
+> bridge / CLI (loopback `Host`, no `Origin`) is unaffected. Set
+> `GHIDRA_MCP_AUTH_TOKEN` to restore cross-origin/remote access. This
+> backward-incompatible default is why this release is a major version bump.
+
+### Security (pre-release hardening)
+
+- **Anti-CSRF / DNS-rebinding guard on the HTTP servers.** Loopback binding
+  does not stop a web page the operator visits from issuing a cross-origin
+  `fetch()` to `127.0.0.1` (responses are `text/plain` and bodies parse as JSON
+  regardless of Content-Type, so it is a CORS "simple request" with no
+  preflight), nor a DNS-rebinding attacker from pointing a hostname at loopback.
+  The TCP plugin (`safeHandler`) and headless server (`safeContext`) now reject
+  requests whose `Origin` is cross-site or whose `Host` is non-loopback, via
+  `SecurityConfig.rejectCrossOriginRequest`. **Behavior change:** a
+  browser-based client on loopback without a token now receives `403` unless
+  `GHIDRA_MCP_AUTH_TOKEN` is set (which disables the guard — the token becomes
+  the control and the operator may then bind a non-loopback address).
+  Non-browser clients (the MCP bridge: loopback `Host`, no `Origin`) are
+  unaffected.
+- **UDS transport now honors `GHIDRA_MCP_AUTH_TOKEN`.** The Unix-domain-socket
+  server enforced no auth, so a configured token silently did not apply there.
+  It is now checked at the single dispatch choke point in `UdsHttpServer`,
+  covering every context including GUI-registered ones. Health endpoints stay
+  exempt.
+- **Destructive project ops honor `GHIDRA_MCP_PROJECT_FOLDER`.** `delete_file`
+  and `create_folder` now enforce the project-scope containment guard that
+  previously gated only reads.
+- **Script-execution gate moved onto the sink.** The 3-arg `runGhidraScript`
+  now enforces `GHIDRA_MCP_ALLOW_SCRIPTS` itself, and the dead, ungated
+  `/run_script` route was removed from `EndpointRegistry` so it cannot be
+  re-wired into an ungated code-execution endpoint.
+- **fun-doc dashboard: anti-CSRF/rebinding guard.** The Flask dashboard rejects
+  cross-origin and non-loopback-`Host` requests (`FUN_DOC_DASHBOARD_ORIGINS`
+  widens the allow-list; `FUN_DOC_DASHBOARD_TOKEN` provides a bearer escape
+  hatch for programmatic/remote API clients behind an authenticating proxy).
+- **Credential leaks closed.** The DB DSN is password-masked before logging in
+  `db/migrate.py` and `scripts/v58_smoke.py`; the `storage` block (which may
+  hold a Postgres URL with a password) is stripped from `GET /api/queue/config`
+  and the `queue_changed` socket broadcast. Ghidra symbol/type names are now
+  HTML-escaped in the dashboard's pipeline view (stored-XSS when RE'ing
+  untrusted binaries).
+- **Docker: runs as a non-root `ghidra` user**, and the builder no longer
+  disables TLS verification when downloading Ghidra.
+- **Defense-in-depth hardening.** Request bodies are capped at 64 MiB on every
+  transport (TCP, headless, UDS) so a lying/absent `Content-Length` cannot force
+  an unbounded allocation. Top-level uncaught-exception handlers now log the
+  detail server-side and return a generic message instead of echoing exception
+  text (path / class-name disclosure) — deliberate per-endpoint validation
+  errors are unchanged. The headless filesystem endpoints (`create_project`,
+  `export_program`, `import_program`, `archive_project`) now honor
+  `GHIDRA_MCP_FILE_ROOT` containment like `load_program` already did. The bridge
+  refuses to proxy to a non-loopback `GHIDRA_DEBUGGER_URL`.
+
+- **Known / accepted (documented, not changed):** the OpenD2 conformance *port
+  pipeline* compiles and runs LLM-authored C by design — it is operator-gated,
+  localhost-only, and never enabled by default; run it only against trusted
+  input. An internal RFC-1918 host (`10.0.10.30`) remains in pre-scrub git
+  history (no credential — the password was already masked); the working tree is
+  clean. `/server/authenticate` receives the Ghidra *server* password as a
+  request field over the loopback/token-gated channel.
 
 ### Added
 
+- **`clear_flow_and_repair` (1 new endpoint).** Wraps Ghidra's
+  `ClearFlowAndRepairCmd` so flow damaged by a wrongly-applied no-return
+  marking can be repaired without a full re-analysis. Companion to the thunk
+  no-return synchronization below; closes #384. Tool count 270 → 271.
+
+- **`analyze_global_completeness` (1 new endpoint).** The data-address analog
+  of `analyze_function_completeness`: scores a global's documentation on a
+  budgeted 0-100 scale across six axes (name, plate comment, real type,
+  formatted bytes — core; enum/equate and struct membership — advanced and
+  forgiven in `effective_score`), and drives the `Complete` property-map band
+  plus DOC_DRAFT-at-target. Tool count 269 → 270.
+
+- **`rename_data_type` (1 new endpoint).** Renames a struct, union, enum, or
+  typedef in place, preserving every existing application of it. The only
+  previous route was clone → re-apply → delete the original, which silently
+  dropped those applications. Rejects built-in types and reports a same-named
+  sibling in the destination category rather than letting Ghidra auto-uniquify
+  to `Foo.conflict`. Closes #401 (follow-up to #93). Tool count 271 → 272.
+
+- **`GHIDRA_MCP_AUTH_TOKEN` for the Python bridge.** The bridge now forwards
+  the shared-secret token on every request, so a plugin started with auth
+  enabled is reachable from `bridge-mcp-ghidra` instead of rejecting it.
+  Closes #358.
+
+- **Program-option and property-map storage tools (11 new endpoints).** Closes
+  the two gaps in Ghidra's per-program / per-address storage surface that had no
+  MCP coverage.
+  - *Program options / metadata* (was partial — only `list_analyzers` read
+    boolean analysis flags): `list_option_groups`, `get_program_options`,
+    `set_program_option`, `remove_program_option`. Read and write any typed
+    option in any group (Program Information, Analyzers, Decompiler, …). Setters
+    support string/int/long/double/float/boolean, infer the type from an
+    existing option, and create custom options on demand.
+  - *Property maps* (was unsupported): `list_property_maps`,
+    `create_property_map`, `delete_property_map`, `set_property`, `get_property`,
+    `remove_property`, `list_properties`. Typed per-address key→value stores
+    (int/long/string/void) — the clean home for arbitrary structured per-function
+    data (store JSON in a string map). Object maps are read-only (they require a
+    registered `Saveable` type).
+  - All wired through `ProgramScriptService` (category `program`), transaction-
+    wrapped via `ThreadingStrategy`, and covered by
+    `tests/integration/test_program_storage_endpoints.py`. Endpoint catalog and
+    tool count updated (256 → 267).
+- **Any-address comment tools: `/get_comment` + `/set_comment` (2 new
+  endpoints).** Read and write any of Ghidra's five comment types (plate, pre,
+  post, EOL, repeatable) at any address — data, instructions, or undefined
+  bytes — where the existing comment tools were function-scoped. Assess-globals
+  requires a comment on every documented global; these are the tools that make
+  that enforceable. Tool count 267 → 269.
+
+- **Autohand Code MCP setup documentation.** The stdio quick start now includes
+  the `autohand mcp add` command for launching the bridge from a cloned checkout.
 - **Coverage gates and baselines across all test tiers.**
   - CI unit job now runs with coverage and a `--cov-fail-under=46` ratchet
     (baseline 53%); the offline fun-doc job adds `--cov=fun-doc` with a floor of
@@ -23,6 +140,92 @@ Complete version history for the Ghidra MCP Server project.
 
 ### Fixed
 
+- **Headless mode couldn't run Java Ghidra scripts.** `run_ghidra_script`
+  rejected `.java` scripts under the headless server because the Java script
+  provider was never initialized. Closes #368.
+
+- **Deploy no longer holds the Ghidra process.** `tools.setup deploy` launched
+  Ghidra as a child and waited on it, so the deploy command never returned
+  while the GUI stayed open. The launcher is now detached.
+
+- **fun-doc: walled or dead providers no longer burn the queue.** Two live
+  failures on 2026-07-24. (1) A quota-walled worker re-attempted the *same*
+  function until its budget ran out and reported every attempt as
+  `completed`: `quota_paused` had no branch in the worker result ladder (it
+  fell through to a catch-all that counts as completed), and the pause —
+  installed by the provider subprocess that made the walled call — was
+  invisible to the dashboard's manager because it only read the pause file
+  at construction. Reads now re-read on an (mtime, size) change, and a walled
+  attempt consumes no budget and parks the worker until the wall clears.
+  (2) A provider that fails terminally (dead credentials, retired client
+  tier — Google retired Gemini Code Assist for individuals that day, making
+  every call an `IneligibleTierError`) had no halt at all and converted the
+  whole queue into `failed` runs one function at a time. Terminal failures
+  are now detected, pause the provider, and stop the worker with
+  `exit_reason=provider_unavailable`.
+
+- **Browser MCP clients (MCP Inspector) couldn't connect over the HTTP
+  transports — CORS preflight got 405.** The stock SDK apps behind
+  `mcp.run()` carry no CORS middleware, so the `OPTIONS` preflight every
+  browser sends before a cross-origin POST was rejected with
+  405 Method Not Allowed, and even successful responses never exposed
+  `mcp-session-id` to scripts. The bridge now builds the Starlette app
+  itself for `streamable-http`/`sse` and wraps it in `CORSMiddleware`:
+  preflights are answered, `mcp-session-id`/`mcp-protocol-version` are
+  exposed, and allowed origins mirror the Host-header policy (loopback on
+  any port always; plus the bind host, the machine's own hostnames on
+  wildcard binds, and `GHIDRA_MCP_ALLOWED_HOSTS` entries). Foreign origins
+  still get no CORS approval, and the SDK's DNS-rebinding protection is
+  unchanged. Regression coverage in `tests/unit/test_bridge_cli.py`
+  (origin-regex matrix + a real preflight driven through the wrapped app).
+
+- **`ensure-prereqs` now self-heals stale cached Ghidra jars.**
+  `install_ghidra_dependencies` skipped an m2 dependency whenever a jar with the
+  matching version string was already cached — but Ghidra re-releases (and dev
+  builds) rebuild jars while keeping the same version, so a stale jar stayed
+  cached forever. A stale test-scoped `DB.jar` cached this way broke the entire
+  offline Java suite (`DomainObjectAdapterDB` → `db.util.ErrorHandler` "cannot be
+  resolved" at test setUp) with no obvious cause. The installer now compares the
+  cached jar's SHA-256 against the install's jar and refreshes on drift, so
+  `python -m tools.setup ensure-prereqs` makes the offline suite runnable from a
+  clean checkout. Covered by `tests/unit/test_setup_ghidra.py`.
+
+- **Thunk no-return metadata repair.** `set_function_no_return` now synchronizes the requested flag across every thunk hop and its terminal target instead of relying on Ghidra's asymmetric delegated setter/local getter behavior. Successful responses include verified `function_no_return` and `terminal_no_return` values, allowing later flow repair to restore valid call fallthrough.
+- **Outbound archive and BSim defaults now fail closed.** Removed the
+  maintainer-specific private archive/database address from runtime code,
+  examples, and documentation. Cross-version archive exchange is disabled
+  unless its URL is explicitly configured, and headless BSim scripts now
+  require a database URL instead of silently selecting a destination.
+- **WOW64 exception-filter gaps found in review of #366/#367.** #366 and #367
+  shipped with no test coverage of `_on_exception`, `_our_bp_addrs`, or the
+  fast path, and their design docs assumed contradictory models of how a
+  planted breakpoint's INT3 is delivered on WOW64 (first-chance EXCEPTION vs.
+  the separate BREAKPOINT event) with no live run confirming either. Added
+  `TestOnExceptionFilter`/`TestDetachClearsBreakpointBookkeeping` in
+  `tests/unit/test_debugger_engine.py` pinning the fast path, WX86 code
+  handling, ret_catch recognition, and fault capture, so a future change
+  can't silently regress either PR's fix. Also fixed two real bugs the
+  contradiction surfaced: (1) `_on_exception`'s address match now queries
+  dbgeng's *live* breakpoint list (`_live_bp_addrs()`) instead of the
+  `_our_bp_addrs` shadow set, which went stale the moment a oneshot
+  breakpoint fired (dbgeng auto-drops the object with no
+  `remove_breakpoint()` call to clean up the shadow entry) — a later real
+  exception at the reused address would otherwise be misclassified as ours
+  and hidden from the target; (2) `detach()` now clears
+  `_our_bp_addrs`/`_bp_id_to_addr`/`_call_guard`/`_stepping`, which
+  previously survived a detach and could misclassify the next attached
+  process's exceptions. **Live-verified end to end on genuine WOW64
+  (2026-07-05)**: compiled a synthetic, disposable x86 process (confirmed
+  PE machine type 0x14C) looping on `kernel32!SleepEx`. Passive path:
+  `go_wait` reported repeated genuine hits under the merged filter even
+  without registering `events.breakpoint()` — dbgeng halts execution at a
+  recognized breakpoint independent of the interest mask, so the fast path
+  does not swallow ordinary passive-capture breakpoints. Guarded-call path:
+  with the thread stopped at that hit, `call_function` (defaulted
+  `ret_catch`) returned cleanly (`returned_to == ret_catch`, not faulted),
+  and passive capture kept working afterward with no run-control poisoning.
+  See the docstring on `_on_exception` and the `reference-debugger-sim-runs`
+  memory.
 - **fun-doc storage bootstrap race.** `_get_storage_repo()` was an unlocked
   check-then-build singleton and `db/migrate.py` recorded schema versions
   with a bare INSERT, so two threads bootstrapping the same fresh SQLite
@@ -74,6 +277,11 @@ Complete version history for the Ghidra MCP Server project.
   `requirements*.txt` files and `pytest.ini` were removed (folded into
   `pyproject.toml`); `tools.setup` installs deps via `uv sync` and deploys the
   built wheel.
+- **fun-doc: OpenD2 conformance port pipeline** (`fun-doc/port_pipeline.py`) —
+  a document → port → prove workflow that classifies a documented function,
+  mints emulation vectors, writes a C draft, and runs it against an isolated
+  conformance harness. Surfaced in the dashboard's Conformance tab. Internal
+  curation subsystem; not exposed as MCP tools. (#381, #363)
 - **CI builds and attaches a wheel.** Release / pre-release workflows build the
   bridge wheel with `uv build` and publish `ghidra_mcp_bridge-X.Y.Z-py3-none-any.whl`
   as the GitHub Release asset instead of the raw bridge script. Test/lint jobs run
@@ -1640,8 +1848,8 @@ time, capped at -20 aggregate per function:
   tools and skips the LLM. Bus events `archive_pushed`,
   `archive_lookup`, `archive_applied`, `archive_apply_failed`,
   `archive_push_failed` for dashboard visibility.
-- Required env: `RE_KB_ARCHIVE_URL` (defaults to
-  `http://10.0.10.30:8422`); empty disables both hooks.
+- Archive exchange is disabled by default. Set `RE_KB_ARCHIVE_URL` to opt
+  fun-doc into the read and write hooks.
 
 ### Changed
 

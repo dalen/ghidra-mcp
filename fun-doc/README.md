@@ -26,7 +26,7 @@ python fun_doc.py --provider claude
 python web.py
 ```
 
-The dashboard is available at `http://127.0.0.1:5001/` by default.
+The dashboard is available at `http://127.0.0.1:5000/` by default.
 
 ## Prerequisites
 
@@ -60,7 +60,7 @@ Configuration in `priority_queue.json`:
   "config": {
     "storage": {
       "backend": "postgres",
-      "url": "postgresql://re_kb:***@10.0.10.30:5432/bsim",
+      "url": "postgresql://re_kb:***@127.0.0.1:5432/bsim",
       "schema": "fun_doc"
     }
   }

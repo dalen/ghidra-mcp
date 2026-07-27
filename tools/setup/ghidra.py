@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -465,15 +466,16 @@ def find_ghidra_executable(ghidra_path: Path) -> Path:
 
 def find_plugin_archive(repo_root: Path) -> Path:
     version = read_pom_versions(repo_root).project_version
-    # Check Gradle output first, then Maven target/ for backward compatibility during transition.
+    # Prefer the freshest current-version output. Both backends may leave artifacts behind,
+    # so fixed backend priority can silently deploy a stale archive.
     candidates = [
         repo_root / "build" / "distributions" / f"GhidraMCP-{version}.zip",
         repo_root / "target" / f"GhidraMCP-{version}.zip",
         repo_root / "target" / "GhidraMCP.zip",
     ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
+    existing_candidates = [candidate for candidate in candidates if candidate.is_file()]
+    if existing_candidates:
+        return max(existing_candidates, key=lambda path: path.stat().st_mtime)
 
     for search_dir in [repo_root / "build" / "distributions", repo_root / "target"]:
         archives = sorted(
@@ -2054,6 +2056,16 @@ def install_ghidratrace_for_debugger(
     return 0
 
 
+def _file_sha256(path: Path) -> str:
+    """Return the SHA-256 hex digest of a file, streamed so large jars don't
+    load fully into memory."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def install_ghidra_dependencies(
     repo_root: Path,
     ghidra_path: Path,
@@ -2076,9 +2088,20 @@ def install_ghidra_dependencies(
             / ghidra_version
             / f"{artifact_id}-{ghidra_version}.jar"
         )
+        # Skip only when the cached jar is byte-identical to the install's jar.
+        # Presence alone is NOT enough: Ghidra re-releases (and dev builds) can
+        # rebuild jars while keeping the same version string, leaving a stale
+        # jar cached under the same coordinates. A stale test-scoped DB.jar this
+        # way broke the offline Java suite (DomainObjectAdapterDB ->
+        # db.util.ErrorHandler "cannot be resolved") until the cache was
+        # refreshed. Compare content so `ensure-prereqs` self-heals.
         if cached_jar.is_file() and not force:
-            print(f"Skipping already installed dependency: {artifact_id}")
-            continue
+            if _file_sha256(cached_jar) == _file_sha256(jar_path):
+                print(f"Skipping already installed dependency: {artifact_id}")
+                continue
+            print(
+                f"Refreshing stale cached dependency (content changed): {artifact_id}"
+            )
 
         command = [
             maven_command,
@@ -2350,7 +2373,13 @@ def start_ghidra(ghidra_path: Path, *, repo_root: Path | None = None, dry_run: b
         print_command(command)
         return 0
 
-    subprocess.Popen(command, cwd=ghidra_path, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.Popen(
+        command,
+        cwd=ghidra_path,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=os.name == "posix",
+    )
     print(f"Started Ghidra from {executable}")
     return 0
 

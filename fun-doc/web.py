@@ -10,10 +10,13 @@ Features:
 - Run log stats: model performance, stuck functions
 """
 
+import hmac
 import json
 import os
+import sys
 import threading
 import time
+import traceback
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -25,12 +28,59 @@ from event_bus import get_bus
 
 import uuid
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _authority_host(value):
+    """Extract the lowercased host from a Host header, an Origin, or a URL
+    authority — stripping scheme, path, port, and IPv6 brackets. Returns None
+    for empty input, and the literal "null" for an opaque Origin (which is
+    never loopback). Mirrors SecurityConfig.extractHost on the Java side."""
+    if not value:
+        return None
+    v = value.strip()
+    if not v:
+        return None
+    if v.lower() == "null":
+        return "null"
+    if "://" in v:                      # Origin: scheme://host[:port]
+        v = v.split("://", 1)[1]
+    v = v.split("/", 1)[0]              # drop any path
+    if v.startswith("["):              # IPv6 literal: [::1]:8089 or [::1]
+        end = v.find("]")
+        return (v[1:end] if end > 0 else v).lower()
+    if v.count(":") == 1:              # host:port -> host (single colon only)
+        v = v.rsplit(":", 1)[0]
+    return v.lower()
+
+
+def _redact_config_secrets(cfg):
+    """Return a copy of the queue config safe to send to clients. The
+    `storage` block can hold a Postgres URL with an embedded password
+    (config.storage.url), which must never reach the browser or a socket
+    broadcast. DB storage is configured via FUN_DOC_DB_URL / the JSON file and
+    is never edited through the dashboard, so dropping it is lossless for the
+    UI."""
+    if not isinstance(cfg, dict):
+        return cfg
+    redacted = dict(cfg)
+    redacted.pop("storage", None)
+    return redacted
+
 # Shared across workers so adaptive-refresh trigger fires once per stale run
 # even with multiple concurrent workers hitting the threshold simultaneously.
 _adaptive_refresh_lock = threading.Lock()
 
 HEARTBEAT_INTERVAL_SEC = float(os.environ.get("FUNDOC_HEARTBEAT_INTERVAL_SEC", "30"))
 STALL_KILL_THRESHOLD_SEC = float(os.environ.get("FUNDOC_STALL_KILL_THRESHOLD_SEC", "900"))
+# Provider sessions may legitimately run past the stall threshold while
+# actively working (idle-based session deadline, 2026-07-17): the worker
+# thread looks wedged to the heartbeat but the session subprocess is streaming
+# provider_turn/tool events. Grace = session idle limit (300s) + margin; the
+# hard cap = session hard cap (2700s) + margin so a wedged-but-chatty session
+# still can't pin a worker forever.
+STALL_ACTIVITY_GRACE_SEC = float(os.environ.get("FUNDOC_STALL_ACTIVITY_GRACE_SEC", "330"))
+STALL_KILL_HARD_CAP_SEC = float(os.environ.get("FUNDOC_STALL_KILL_HARD_CAP_SEC", "3000"))
 
 
 class WorkerManager:
@@ -48,12 +98,30 @@ class WorkerManager:
         self._in_progress_keys = set()
         self._load_queue = load_queue
         self._save_queue = save_queue
+        # Session-activity stamps for the stall watchdog: high-frequency
+        # provider-session events carry the owning worker's id; a fresh stamp
+        # means the "stalled" worker thread is really inside a long active
+        # provider call and must not be stall-killed yet.
+        for _evt in ("provider_turn", "tool_call", "tool_result"):
+            self._bus.on(_evt, self._note_session_activity)
         # Q11: per-binary lock for globals workers. Holds the binary path
         # of every binary currently being processed by a globals worker
         # so a second launch on the same binary is rejected with a clear
         # error rather than silently fighting the first worker for writes.
         self._globals_active_binaries = set()
+        # Per-binary lock for PORT workers (Stage 2/3 conformance pipeline),
+        # same rationale as _globals_active_binaries above -- mirrors it
+        # rather than sharing it since port and globals work are unrelated
+        # write streams (port never touches Ghidra function names/comments).
+        self._port_active_binaries = set()
         self._bus.on("provider_timeout", self._handle_provider_timeout)
+        # Every runs.jsonl row (drafts, retries, sub-step results) refreshes the
+        # owning worker's heartbeat. Without this, a PORT candidate that spends
+        # many minutes inside one function (e.g. 3 malformed-response retries at
+        # ~4 min each) looks stalled to the watchdog — observed 2026-07-14:
+        # stale_sec climbed to 506s on a healthy worker, 900s would have
+        # false-killed it.
+        self._bus.on("run_logged", self._handle_run_logged)
         self._watchdog_stop = threading.Event()
         self._watchdog_thread = threading.Thread(
             target=self._watchdog_loop,
@@ -61,6 +129,15 @@ class WorkerManager:
             daemon=True,
         )
         self._watchdog_thread.start()
+
+    def _handle_run_logged(self, data):
+        worker_id = (data or {}).get("worker_id")
+        if not worker_id:
+            return
+        with self._lock:
+            worker = self._workers.get(worker_id)
+            if worker and worker.get("status") in ("starting", "running"):
+                worker["last_heartbeat_at"] = datetime.now().isoformat()
 
     def _set_phase(self, worker_id, phase):
         with self._lock:
@@ -88,7 +165,22 @@ class WorkerManager:
                         last_dt = now
                     stale_sec = max(0.0, (now - last_dt).total_seconds())
                     phase = worker.get("phase", "unknown")
-                    if stale_sec > STALL_KILL_THRESHOLD_SEC and not worker.get("stall_kill_fired", False):
+                    # Activity-aware gate: a stale heartbeat with a fresh
+                    # session-activity stamp is a long ACTIVE provider call,
+                    # not a hang — skip the kill until the hard cap.
+                    act_age = None
+                    act_raw = worker.get("last_session_activity_at")
+                    if act_raw:
+                        try:
+                            act_age = (now - datetime.fromisoformat(act_raw)).total_seconds()
+                        except (TypeError, ValueError):
+                            act_age = None
+                    session_active = act_age is not None and act_age < STALL_ACTIVITY_GRACE_SEC
+                    if (
+                        stale_sec > STALL_KILL_THRESHOLD_SEC
+                        and not worker.get("stall_kill_fired", False)
+                        and (not session_active or stale_sec > STALL_KILL_HARD_CAP_SEC)
+                    ):
                         worker["stall_kill_fired"] = True
                         worker["stop_flag"].set()
                         worker["status"] = "stopping"
@@ -131,6 +223,34 @@ class WorkerManager:
 
             if heartbeats or kill_requests:
                 self._emit_status()
+
+    def _note_session_activity(self, data):
+        """Bus subscriber: stamp the owning worker on every provider-session
+        event so the stall watchdog can tell long-active from wedged."""
+        try:
+            wid = (data or {}).get("worker_id")
+            if wid and wid in self._workers:
+                self._workers[wid]["last_session_activity_at"] = datetime.now().isoformat()
+        except Exception:
+            pass
+
+    def _log_worker_stopped(self, worker_id, worker):
+        """Persist worker exit to events.jsonl so a clean finish is
+        distinguishable from a crash after the in-memory record is pruned."""
+        try:
+            from event_log import log_event
+            log_event(
+                "worker.stopped",
+                worker_id=worker_id,
+                provider=worker.get("provider"),
+                mode=worker.get("mode"),
+                status=worker.get("status"),
+                exit_reason=worker.get("exit_reason"),
+                error=worker.get("last_error"),
+                progress=dict(worker.get("progress") or {}),
+            )
+        except Exception:
+            pass
 
     def _serialize_worker(self, worker):
         return {
@@ -211,11 +331,28 @@ class WorkerManager:
         continuous=False,
         restored=False,
         mode="functions",
+        addresses=None,
     ):
+        # Refuse a disabled provider up front (config.disabled_providers /
+        # FUNDOC_DISABLED_PROVIDERS) — e.g. gemini once Google retired its
+        # backend. Clear message beats a worker that fails every function.
+        from fun_doc import provider_is_disabled as _provider_is_disabled
+
+        if _provider_is_disabled(provider):
+            raise ValueError(
+                f"Provider '{provider}' is disabled "
+                "(config.disabled_providers / FUNDOC_DISABLED_PROVIDERS)."
+            )
+
         # Q9: globals worker requires a binary — refuse early with a clear
         # message rather than launching a worker that can't pick a target.
         if mode == "globals" and not binary:
             raise ValueError("Globals worker requires a binary — select one in the header.")
+        # PORT worker also requires a binary: EMULATION_CONFORMANCE_PLAN.md
+        # Sec 15 ports one binary at a time (D2Common first) by design —
+        # there's no sensible "all binaries" PORT run.
+        if mode == "port" and not binary:
+            raise ValueError("Port worker requires a binary — select one in the header.")
         with self._lock:
             active = {
                 wid: w
@@ -238,6 +375,13 @@ class WorkerManager:
                 )
             if mode == "globals":
                 self._globals_active_binaries.add(binary)
+            if mode == "port" and binary in self._port_active_binaries:
+                raise ValueError(
+                    f"A port worker is already running on {binary}. "
+                    "Wait for it to finish or stop it first."
+                )
+            if mode == "port":
+                self._port_active_binaries.add(binary)
 
             worker_id = str(uuid.uuid4())[:8]
             stop_flag = threading.Event()
@@ -270,6 +414,9 @@ class WorkerManager:
                 "continuous": continuous,
                 "model": model,
                 "binary": binary,
+                # Targeted-fix mode (cleanup queue): dispatch exactly these
+                # addresses instead of walking the binary. Globals mode only.
+                "addresses": list(addresses) if addresses else None,
                 "thread": None,
                 "stop_flag": stop_flag,
                 "started_at": datetime.now().isoformat(),
@@ -363,6 +510,10 @@ class WorkerManager:
                     "continuous": w.get("continuous", False),
                     "model": w["model"],
                     "binary": w["binary"],
+                    # Lane the worker runs in (functions / globals / port). The
+                    # pipeline page keys the globals-typing bar on this so it can
+                    # hide while a globals worker is active on the binary.
+                    "mode": w.get("mode", "functions"),
                     "status": w["status"],
                     "restored": bool(w.get("restored", False)),
                     "timeout_count": int(w.get("timeout_count", 0) or 0),
@@ -401,11 +552,15 @@ class WorkerManager:
 
     def _run_worker(self, worker_id):
         """Worker loop entry point. Dispatches to the function-worker
-        pipeline (default) or the globals-worker pipeline based on the
-        `mode` field captured at start_worker time."""
+        pipeline (default), the globals-worker pipeline, or the PORT
+        (OpenD2 conformance) pipeline based on the `mode` field captured at
+        start_worker time."""
         worker = self._workers.get(worker_id)
         if worker and worker.get("mode") == "globals":
             self._run_worker_globals(worker_id)
+            return
+        if worker and worker.get("mode") == "port":
+            self._run_worker_port(worker_id)
             return
         self._run_worker_functions(worker_id)
 
@@ -414,6 +569,13 @@ class WorkerManager:
         from event_bus import set_worker_id
 
         set_worker_id(worker_id)  # Tag all events from this thread
+
+        # DOC-rung write-back parity with the globals lane (which stamps
+        # unconditionally): without this the pipeline page's Fn Doc bar never
+        # moves — it counts DOC_* tags in Ghidra, and fun_doc's stamp after a
+        # completed run is gated on FUNDOC_DOC_TAGS=1 (found 2026-07-21: workers
+        # completed 485 D2Client runs while the bar sat at zero).
+        os.environ.setdefault("FUNDOC_DOC_TAGS", "1")
 
         worker = self._workers[worker_id]
         current_key = None
@@ -819,6 +981,49 @@ class WorkerManager:
                     if worker["stop_flag"].is_set():
                         break
                     continue  # leave function re-pickable; pick next once healthy
+                elif result == "provider_unavailable":
+                    # Dead credentials / retired client tier. Retrying can't
+                    # fix it and every remaining function would fail the same
+                    # way, so stop with a reason the dashboard can show rather
+                    # than converting the whole queue into `failed` runs.
+                    processed -= 1
+                    worker["exit_reason"] = "provider_unavailable"
+                    self._bus.emit(
+                        "worker_stopped",
+                        {
+                            "worker_id": worker_id,
+                            "reason": "provider_unavailable",
+                            "progress": dict(worker["progress"]),
+                        },
+                    )
+                    break
+                elif result == "quota_paused":
+                    # The provider is walled: no API call was made and the
+                    # function was left untouched. This must not consume the
+                    # worker's budget or count as progress — before this
+                    # branch existed it fell through to the catch-all below
+                    # and was logged as "completed", so a walled worker
+                    # reported a clean run while re-attempting one function
+                    # until its count ran out. Yield to the pause instead
+                    # (installed by the provider subprocess, picked up
+                    # cross-process by the manager's file reload) and re-pick
+                    # work only once the wall clears.
+                    processed -= 1
+                    worker["_quota_pause_count"] = (
+                        worker.get("_quota_pause_count", 0) + 1
+                    )
+                    self._emit_status()
+                    if _yield_for_quota_pause():
+                        if worker["stop_flag"].is_set():
+                            break
+                        continue
+                    # No pause visible for our (provider, FULL-model) pair —
+                    # e.g. the wall was detected against an audit/handoff
+                    # model. Back off before re-picking so a mis-attributed
+                    # wall degrades to slow retries, never a hot loop.
+                    if worker["stop_flag"].wait(30):
+                        break
+                    continue
                 elif result in ("completed", "partial"):
                     worker["progress"]["completed"] += 1
                     session["completed"] += 1
@@ -907,6 +1112,7 @@ class WorkerManager:
                 finalize_worker_session(session)
 
         except Exception as e:
+            worker["last_error"] = str(e)
             self._bus.emit(
                 "worker_stopped", {"worker_id": worker_id, "reason": f"error: {e}"}
             )
@@ -935,6 +1141,7 @@ class WorkerManager:
                     "progress": dict(worker["progress"]),
                 },
             )
+            self._log_worker_stopped(worker_id, worker)
 
     def _run_worker_globals(self, worker_id):
         """Globals worker loop. Per Q1-Q12 design: pulls every issue-global
@@ -1008,7 +1215,19 @@ class WorkerManager:
                 on_progress=_on_progress,
                 on_started=_on_global_started,
                 exclude_binaries_provider=_exclude_binaries,
+                target_addresses=worker.get("addresses"),
             )
+            # Stash for the worker_stopped emit in the finally block so the
+            # dashboard pane can render the skip breakdown — "0 processed"
+            # alone can't distinguish "binary is drained" from "worker did
+            # nothing".
+            worker["globals_summary"] = {
+                "processed": summary.get("processed"),
+                "totals": summary.get("totals"),
+                "skip_reasons": summary.get("skip_reasons"),
+                "stopped_reason": summary.get("stopped_reason"),
+                "binaries_visited": summary.get("binaries_visited"),
+            }
             print(
                 f"  [globals-worker {worker_id}] done: "
                 f"{summary['processed']} processed across "
@@ -1017,6 +1236,7 @@ class WorkerManager:
                 flush=True,
             )
         except Exception as e:
+            worker["last_error"] = str(e)
             self._bus.emit(
                 "worker_stopped",
                 {"worker_id": worker_id, "reason": f"error: {e}"},
@@ -1040,46 +1260,160 @@ class WorkerManager:
                     "reason": worker["status"],
                     "mode": "globals",
                     "progress": dict(worker["progress"]),
+                    "summary": worker.get("globals_summary"),
+                },
+            )
+            self._log_worker_stopped(worker_id, worker)
+
+    def _run_worker_port(self, worker_id):
+        """PORT (OpenD2 conformance) worker loop. Drafts + proves Stage 2/3
+        candidates on the selected binary via port_pipeline.py + fun_doc's
+        run_port_worker_pass. Per-binary lock is handled in start_worker /
+        this method's finally block (mirrors _run_worker_globals exactly)."""
+        from event_bus import set_worker_id
+
+        set_worker_id(worker_id)
+        worker = self._workers[worker_id]
+        try:
+            from fun_doc import run_port_worker_pass
+
+            # Live-prove parity with the --port CLI (which defaults these ON):
+            # without FUNDOC_LIVE_PROVE the dashboard's Prove lane is static-
+            # harness-only -- global/handle getters (the main CONF_LIVE
+            # producers) all skip with "needs FUNDOC_LIVE_PROVE=1". Gate on
+            # the oracle actually answering so a dead game degrades to the
+            # old static-only behavior instead of failing every candidate.
+            try:
+                from port_live_prove import check_oracle_alive
+
+                if check_oracle_alive():
+                    os.environ.setdefault("FUNDOC_LIVE_PROVE", "1")
+                    os.environ.setdefault("FUNDOC_SHADOW_PROMOTE", "1")
+                    print(f"  [port-worker {worker_id}] live oracle up -> live-prove enabled", flush=True)
+                else:
+                    print(f"  [port-worker {worker_id}] live oracle DOWN -> static-only pass", flush=True)
+            except Exception:
+                pass
+
+            worker["status"] = "running"
+            self._set_phase(worker_id, "port_running")
+            self._emit_status()
+            self._bus.emit(
+                "worker_started",
+                {
+                    "worker_id": worker_id,
+                    "mode": "port",
+                    "provider": worker["provider"],
+                    "count": worker["count"],
+                    "binary": worker.get("binary"),
+                    "restored": worker.get("restored", False),
                 },
             )
 
+            def _on_progress(program, address, result, processed, total):
+                bucket = "completed" if result == "proven_pending_review" else (
+                    "skipped" if result in ("stateful_skip", "malformed_response", "no_vectors") else "failed"
+                )
+                worker["progress"][bucket] = worker["progress"].get(bucket, 0) + 1
+                with self._lock:
+                    worker["last_heartbeat_at"] = datetime.now().isoformat()
+                self._emit_status()
+                # Close the pane's per-function block, exactly like the
+                # document lane does. Without this the Prove pane never showed
+                # candidate outcomes at all — a batch looked like it "attempted
+                # the first function and stopped" while 20+ skips flew by
+                # invisibly (observed 2026-07-14, worker 85903b12).
+                cur = worker["progress"].get("current") or {}
+                self._bus.emit("function_complete", {
+                    "worker_id": worker_id,
+                    "name": cur.get("name") or address,
+                    "address": address,
+                    "result": bucket if bucket != "failed" else result,
+                    "skip_type": result if bucket == "skipped" else None,
+                    "reason": result,
+                    "mode": "port",
+                    "processed": processed,
+                    "total": total,
+                })
+
+            def _on_started(program, address, name):
+                worker["progress"]["current"] = {
+                    "key": f"{program}::{address}",
+                    "name": name or address,
+                    "address": address,
+                    "program": Path(program).name,
+                }
+                with self._lock:
+                    worker["last_heartbeat_at"] = datetime.now().isoformat()
+                self._emit_status()
+                # Open a per-function block in the pane (mirrors document lane).
+                self._bus.emit("function_started", {
+                    "worker_id": worker_id,
+                    "name": name or address,
+                    "address": address,
+                    "program": Path(program).name,
+                    "mode": "port",
+                })
+
+            summary = run_port_worker_pass(
+                worker_id=worker_id,
+                active_binary=worker.get("binary"),
+                provider=worker["provider"],
+                model=worker.get("model"),
+                count=int(worker.get("count") or 1),
+                stop_flag=worker["stop_flag"],
+                on_progress=_on_progress,
+                on_started=_on_started,
+            )
+            # Surface WHY the pass ended for every exit, not just an empty
+            # queue. "exhausted" (candidate pool consumed before `count`
+            # completions) previously vanished silently — the worker just
+            # disappeared from the dashboard with 0 completed and no
+            # explanation (2026-07-14).
+            worker["exit_reason"] = summary.get("stopped_reason")
+            print(
+                f"  [port-worker {worker_id}] done: {summary['processed']} processed "
+                f"(reason={summary.get('stopped_reason')}) totals={summary.get('totals')}",
+                flush=True,
+            )
+            self._bus.emit("port_pass_done", {
+                "worker_id": worker_id,
+                "processed": summary.get("processed"),
+                "count": worker.get("count"),
+                "stopped_reason": summary.get("stopped_reason"),
+                "totals": summary.get("totals") or {},
+            })
+        except Exception as e:
+            worker["last_error"] = str(e)
+            self._bus.emit(
+                "worker_stopped",
+                {"worker_id": worker_id, "reason": f"error: {e}"},
+            )
+        finally:
+            worker["status"] = (
+                "finished" if not worker["stop_flag"].is_set() else "stopped"
+            )
+            worker["restore_on_restart"] = False
+            worker["finished_at"] = datetime.now().isoformat()
+            worker["progress"]["current"] = None
+            with self._lock:
+                if worker.get("binary"):
+                    self._port_active_binaries.discard(worker["binary"])
+                self._persist_active_workers()
+            self._emit_status()
+            self._bus.emit(
+                "worker_stopped",
+                {
+                    "worker_id": worker_id,
+                    "reason": worker["status"],
+                    "mode": "port",
+                    "progress": dict(worker["progress"]),
+                },
+            )
+            self._log_worker_stopped(worker_id, worker)
+
     def _emit_status(self):
         self._socketio.emit("worker_status", self.get_status())
-
-
-def compute_skip_reason(func: dict, key: str, pinned_keys: set) -> str | None:
-    """Return the selector skip reason for ``func``, or ``None`` if eligible.
-
-    Mirrors the gates in ``fun_doc.select_candidates`` exactly. Surfaced via
-    the dashboard's function-list APIs so the UI can show "why isn't this
-    function getting picked?" without users reading source. Keep in sync
-    with the selector; if a new gate lands there, add a branch here.
-
-    Every gate respects pinning — in ``select_candidates`` the pattern is
-    ``if func.get("X") and not is_pinned: continue``, so a pinned row with
-    a library_code / propagation / stagnation / etc. flag still gets
-    admitted at high priority. The dashboard column must reflect that
-    same reality or it'll lie to the user about what the worker will do.
-    """
-    is_pinned = key in pinned_keys
-    if func.get("library_code") and not is_pinned:
-        return "library_code"
-    if (
-        not is_pinned
-        and func.get("name_source") == "propagation"
-        and (
-            func.get("name_confidence") is None
-            or func.get("name_confidence", 0) < 0.5
-        )
-    ):
-        return "propagation"
-    if func.get("decompile_timeout") and not is_pinned:
-        return "decompile_timeout"
-    if func.get("stagnation_runs", 0) >= 3 and not is_pinned:
-        return "stagnation"
-    if func.get("recovery_pass_done") and not is_pinned:
-        return "recovery_done"
-    return None
 
 
 def create_app(state_file, event_bus=None, dashboard_port=5000):
@@ -1103,6 +1437,54 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
 
     socketio = SocketIO(app, async_mode="threading", cors_allowed_origins=allowed_origins)
 
+    # --- Anti-CSRF / DNS-rebinding guard -------------------------------------
+    # The dashboard binds 127.0.0.1 only, but loopback binding does NOT stop a
+    # web page on any site the operator visits from issuing a cross-origin
+    # fetch() to 127.0.0.1, nor a DNS-rebinding attacker from pointing a
+    # hostname at loopback. Every /api/* route here is an unauthenticated
+    # control-plane action (start/stop workers, rewrite provider config, drive
+    # the compile-and-run port pipeline), so this mirrors the Java server's
+    # SecurityConfig.rejectCrossOriginRequest: reject browser requests whose
+    # Origin is not allow-listed and requests whose Host is not loopback.
+    #
+    # Top-level navigations (no Origin header) and same-origin XHR/socket.io
+    # (Origin == the loopback dashboard origin) pass untouched, so the local
+    # browser UI is unaffected. allowed_origins widens only via
+    # FUN_DOC_DASHBOARD_ORIGINS (reverse-proxy / remote setups), which should
+    # be paired with FUN_DOC_DASHBOARD_TOKEN below and a proxy that
+    # authenticates users.
+    _dashboard_token = os.environ.get("FUN_DOC_DASHBOARD_TOKEN", "").strip()
+    _allowed_hosts = {_authority_host(o) for o in allowed_origins}
+    _allowed_hosts.discard(None)
+
+    @app.before_request
+    def _guard_cross_origin():
+        # Escape hatch for programmatic / remote API clients: a correct bearer
+        # token bypasses the Origin/Host checks (a browser CSRF cannot supply
+        # it, and adding the header forces a CORS preflight that fails).
+        if _dashboard_token:
+            supplied = request.headers.get("Authorization", "")
+            if hmac.compare_digest(supplied, f"Bearer {_dashboard_token}"):
+                return None
+        origin = request.headers.get("Origin")
+        if origin and origin not in allowed_origins:
+            return (
+                jsonify({"error": "Cross-origin request refused. This dashboard "
+                         "rejects requests from other origins to prevent CSRF / "
+                         "DNS-rebinding. Set FUN_DOC_DASHBOARD_ORIGINS (and "
+                         "FUN_DOC_DASHBOARD_TOKEN) for remote access."}),
+                403,
+            )
+        host = _authority_host(request.headers.get("Host"))
+        if host is not None and host not in _allowed_hosts:
+            return (
+                jsonify({"error": "Request refused: non-allow-listed Host header "
+                         "(DNS-rebinding guard). Set FUN_DOC_DASHBOARD_ORIGINS for "
+                         "reverse-proxy / remote setups."}),
+                403,
+            )
+        return None
+
     # Wire EventBus -> SocketIO bridge
     bus = event_bus or get_bus()
 
@@ -1124,6 +1506,13 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
         "global_started",
         "global_complete",
         "globals_binary_advanced",
+        "port_drafted",
+        "port_vectors_minted",
+        "port_harness_result",
+        "port_live_prove_result",
+        "shadow_promote_result",
+        "port_proven_pending_review",
+        "port_pass_done",
         "tool_result",
         "model_text",
         "score_update",
@@ -1136,6 +1525,18 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
         "provider_timeout",
     ]:
         bus.on(evt, bridge(evt))
+
+    # Nudge the new /pipeline dashboard to re-read Ghidra whenever conformance/doc state
+    # actually changes -- an item documented/proven, or a worker pass ended. The pipeline
+    # frontend listens for `conf_changed` and (debounced) refreshes. Separate from the
+    # per-tick worker_status stream so a real state change always forces an authoritative
+    # re-read even if the status debounce missed the final transition.
+    def _conf_changed(_data=None):
+        socketio.emit("conf_changed", {})
+
+    for _evt in ("function_complete", "global_complete",
+                 "port_proven_pending_review", "worker_stopped"):
+        bus.on(_evt, _conf_changed)
 
     # --- Bridge event counters for the audit watcher ---
     # The audit rule `bridge_counter_stall` (fun-doc/audit/rules.yaml)
@@ -1168,7 +1569,7 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
 
     # --- Data loading helpers ---
 
-    def load_state():
+    def load_state(*, binary_name=None):
         """Delegate to fun_doc.load_state — backed by the storage repository
         (Postgres or SQLite per the configured backend). The retry +
         raise-on-corrupt semantics live in fun_doc itself; duplicating them
@@ -1176,29 +1577,77 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
         web.py's old implementation silently returned an empty stub on race
         conditions which was then written back over the real state.json."""
         from fun_doc import load_state as _fd_load_state
-        return _fd_load_state()
+        return _fd_load_state(binary_name=binary_name)
 
-    def _save_state_inline(state):
-        """Delegate to fun_doc.save_state — backed by the storage repository.
-        Refuses to overwrite a populated state.json with an empty-functions
-        dict, which is the failure mode that nuked ~110 MB of state on
-        2026-05-03 (a load_state race returned an empty stub that this
-        function then persisted). The guardrail only fires for users
-        mid-migration — once state.json is renamed to .migrated-<ISO>,
-        sf.exists() is false and the repo backend's own integrity checks
-        take over."""
-        from fun_doc import save_state as _fd_save_state
+    def _load_dashboard_state():
+        """State snapshot for the read-only stats paths.
 
-        sf = app.config["STATE_FILE"]
-        new_func_count = len(state.get("functions") or {})
-        if new_func_count == 0 and sf.exists() and sf.stat().st_size > 1024:
-            raise RuntimeError(
-                f"_save_state_inline refused: would overwrite "
-                f"{sf.stat().st_size:,}-byte state.json with empty-functions "
-                "stub. Caller likely raced load_state and is about to clobber "
-                "real data. Investigate the call site."
-            )
-        _fd_save_state(state)
+        When an active binary is set, the functions load is filtered to
+        that binary in SQL (a full materialization costs ~3 s on a 60K-row
+        store; one binary is a few hundred ms). compute_stats() gets every
+        scanned binary for the header dropdown via list_scanned_binaries()
+        instead of deriving it from the (now filtered) functions dict.
+        """
+        from fun_doc import get_state_meta, load_state as _fd_load_state
+
+        active = (get_state_meta() or {}).get("active_binary")
+        return _fd_load_state(binary_name=active) if active else _fd_load_state()
+
+    # --- Stats snapshot cache -------------------------------------------
+    # /api/stats pays a full state materialization per compute. Cache the
+    # computed stats dict briefly; bus events that imply data changed
+    # invalidate it, and the TTL bounds staleness from writers outside this
+    # process (CLI runs) whose bus events never reach us.
+    _stats_cache = {"stats": None, "ts": 0.0, "version": 0}
+    _stats_cache_lock = threading.Lock()  # cheap guard; never held during compute
+    _stats_compute_lock = threading.Lock()  # serializes recomputes
+    _STATS_CACHE_TTL = 2.0  # seconds
+
+    def _invalidate_stats_cache(_data=None):
+        with _stats_cache_lock:
+            _stats_cache["stats"] = None
+            _stats_cache["version"] += 1
+
+    for _evt in (
+        "state_changed",
+        "queue_changed",
+        "scan_complete",
+        "run_logged",
+        "score_update",
+        "function_complete",
+        "global_complete",
+    ):
+        bus.on(_evt, _invalidate_stats_cache)
+
+    def get_stats_snapshot():
+        """Cached compute_stats() for read-only consumers.
+
+        The returned dict is SHARED between callers — treat it as frozen;
+        copy before mutating (see api_stats).
+        """
+        with _stats_cache_lock:
+            if (
+                _stats_cache["stats"] is not None
+                and time.monotonic() - _stats_cache["ts"] < _STATS_CACHE_TTL
+            ):
+                return _stats_cache["stats"]
+        with _stats_compute_lock:
+            with _stats_cache_lock:
+                # Re-check: another request may have filled it while we waited.
+                if (
+                    _stats_cache["stats"] is not None
+                    and time.monotonic() - _stats_cache["ts"] < _STATS_CACHE_TTL
+                ):
+                    return _stats_cache["stats"]
+                version = _stats_cache["version"]
+            stats = compute_stats(_load_dashboard_state())
+            with _stats_cache_lock:
+                # Skip caching if a write invalidated mid-compute — the
+                # snapshot may predate the write.
+                if _stats_cache["version"] == version:
+                    _stats_cache["stats"] = stats
+                    _stats_cache["ts"] = time.monotonic()
+            return stats
 
     def load_queue():
         from fun_doc import load_priority_queue
@@ -1387,11 +1836,44 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
                 "today_skipped_delta": 0,
             },
             "today": {"runs": 0, "success_rate": 0, "avg_delta": 0, "by_provider": {}},
+            "globals_today": {"runs": 0, "completed": 0, "skipped": 0, "failed": 0, "renames": 0},
         }
         if not logs:
             return empty
 
         today = datetime.now().date().isoformat()
+
+        # Model-performance is a FUNCTION-doc panel: globals/port runs carry
+        # no score deltas, so counting them dilutes success_rate toward 0%
+        # whenever those workers dominate the log tail (observed live:
+        # "0.0% success, 500 unknown tc" after a globals-heavy day). Split
+        # them out — globals get their own today-summary; port runs have
+        # their own panel elsewhere.
+        NON_FUNCTION_MODES = ("globals", "port", "port_handle", "port_live")
+        g_today = [
+            l for l in logs
+            if l.get("mode") == "globals" and l.get("timestamp", "").startswith(today)
+        ]
+        globals_today = {
+            "runs": len(g_today),
+            "completed": sum(1 for l in g_today if l.get("result") in ("completed", "improved")),
+            "skipped": sum(1 for l in g_today if l.get("result") == "skipped"),
+            "failed": sum(
+                1 for l in g_today
+                if l.get("result") in ("no_change", "audit_fail", "regressed", "blocked", "lateral_change")
+            ),
+            "renames": sum(
+                1 for l in g_today
+                if l.get("result") in ("completed", "improved")
+                and l.get("name_before") and l.get("name")
+                and l.get("name_before") != l.get("name")
+            ),
+        }
+        logs = [l for l in logs if l.get("mode") not in NON_FUNCTION_MODES]
+        if not logs:
+            empty["globals_today"] = globals_today
+            return empty
+
         today_logs = [l for l in logs if l.get("timestamp", "").startswith(today)]
 
         deltas = []
@@ -1575,6 +2057,7 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
             ),
             "avg_delta": round(sum(deltas) / len(deltas), 1) if deltas else 0,
             "success_rate": round(success / len(logs) * 100, 1) if logs else 0,
+            "globals_today": globals_today,
             "by_provider": provider_stats,
             "handoffs": {
                 "total": sum(handoff_chains.values()),
@@ -1617,19 +2100,29 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
     def compute_stats(state):
         all_funcs = state.get("functions", {})
         active_binary = state.get("active_binary")
-        # Available binaries: merge Ghidra project files + already-scanned
+        # Available binaries: merge Ghidra project files + already-scanned.
+        # Scanned names come from a DISTINCT query, not the functions dict —
+        # _load_dashboard_state() may have filtered the dict to the active
+        # binary, and the dropdown must still list every scanned binary.
         folder = state.get("project_folder", "/")
         project_binaries = _fetch_project_binaries(folder)
-        scanned_binaries = sorted(
-            set(f.get("program_name", "unknown") for f in all_funcs.values())
-        )
+        try:
+            from fun_doc import list_scanned_binaries
+
+            scanned_binaries = list_scanned_binaries()
+        except Exception:
+            scanned_binaries = sorted(
+                set(f.get("program_name", "unknown") for f in all_funcs.values())
+            )
         available_binaries = sorted(set(project_binaries + scanned_binaries))
-        # Filter to active binary if set
+        # Filter to active binary if set (full program path disambiguates same-named
+        # binaries when active_binary is a path; else falls back to the bare name).
         if active_binary:
+            from fun_doc import func_in_binary
             funcs = {
                 k: v
                 for k, v in all_funcs.items()
-                if v.get("program_name") == active_binary
+                if func_in_binary(v, active_binary)
             }
         else:
             funcs = all_funcs
@@ -1660,7 +2153,6 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
                 "by_program": {},
                 "sessions": [],
                 "roi_queue": [],
-                "all_functions": [],
                 "deduction_breakdown": [],
                 "run_stats": compute_run_stats([]),
                 "project_folder": state.get("project_folder", "unknown"),
@@ -1672,11 +2164,14 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
                 "queue_meta": queue_meta,
             }
         fixable_lo = max(good_enough - 20, 0)
-        done = sum(1 for f in scoreable.values() if f["score"] >= good_enough)
+        # Missing "score" (row not yet scored — e.g. fresh scan/port-pipeline
+        # inserts) counts as 0 here; the per-function "unscored" flag below
+        # tells the frontend it means "unknown", not "0% done".
+        done = sum(1 for f in scoreable.values() if (f.get("score") or 0) >= good_enough)
         fixable_count = sum(
-            1 for f in scoreable.values() if fixable_lo <= f["score"] < good_enough
+            1 for f in scoreable.values() if fixable_lo <= (f.get("score") or 0) < good_enough
         )
-        needs_work = sum(1 for f in scoreable.values() if f["score"] < fixable_lo)
+        needs_work = sum(1 for f in scoreable.values() if (f.get("score") or 0) < fixable_lo)
         pct = (done / total * 100) if total > 0 else 0
         audited = sum(1 for f in scoreable.values() if f.get("audit_count", 0) > 0)
         escalated = sum(
@@ -1696,7 +2191,7 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
             "0-9": 0,
         }
         for f in scoreable.values():
-            s = f["score"]
+            s = f.get("score") or 0
             if s >= 100:
                 buckets["100"] += 1
             elif s >= 90:
@@ -1723,52 +2218,10 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
         for f in scoreable.values():
             prog = f.get("program_name", "unknown")
             by_program[prog]["total"] += 1
-            if f["score"] >= good_enough:
+            if (f.get("score") or 0) >= good_enough:
                 by_program[prog]["done"] += 1
             else:
                 by_program[prog]["remaining"] += 1
-        pinned_keys = set(queue.get("pinned", []))
-        func_list = []
-        for key, func in funcs.items():
-            if func.get("is_thunk") or func.get("is_external"):
-                continue
-            func_list.append(
-                {
-                    "key": key,
-                    "name": func["name"],
-                    "address": func["address"],
-                    "program": func.get("program_name", ""),
-                    "score": func["score"],
-                    "fixable": round(func.get("fixable", 0), 1),
-                    "callers": func.get("caller_count", 0),
-                    "is_leaf": func.get("is_leaf", False),
-                    "last_result": func.get("last_result"),
-                    "pinned": key in pinned_keys,
-                    # True when state.json has never had analyze_function_completeness
-                    # run for this entry — score=0 here means "unknown", not "0% done"
-                    "unscored": not func.get("last_processed"),
-                    "tool_calls": func.get("tool_calls"),
-                    "tool_calls_known": func.get("tool_calls_known"),
-                    # Provenance (#204) — surface name_source, the source-binary
-                    # forensic pointer, the gate-confidence, and the selector
-                    # skip reason (None when eligible).
-                    "name_source": func.get("name_source") or "scan",
-                    "name_source_binary": func.get("name_source_binary"),
-                    "name_confidence": func.get("name_confidence"),
-                    "skip_reason": compute_skip_reason(func, key, pinned_keys),
-                }
-            )
-        func_list.sort(key=lambda x: x["score"])
-        all_func_total = len(func_list)
-        # Cap the inlined SSR list to keep initial dashboard HTML manageable.
-        # Without this, /-route emits ~70 MB of <tr> rows for a 60k-function
-        # state.json — initial page load takes 5+s. The full list is still
-        # available via paginated APIs (/api/queue/*, /api/cross_binary_progress)
-        # so the JS layer can render the rest on demand. Sorted ascending by
-        # score above, so the cap keeps the lowest-score (highest-value-to-fix)
-        # functions visible — the rows users actually want to see first.
-        SSR_FUNC_ROW_CAP = 500
-        func_list_capped = func_list[:SSR_FUNC_ROW_CAP]
         return {
             "total": total,
             "done": done,
@@ -1783,9 +2236,6 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
             "roi_queue": compute_roi_queue(funcs, queue, active_binary=active_binary)[
                 :50
             ],
-            "all_functions": func_list_capped,
-            "all_functions_total": all_func_total,
-            "all_functions_capped_to": SSR_FUNC_ROW_CAP,
             "deduction_breakdown": compute_deduction_breakdown(funcs),
             "run_stats": compute_run_stats(load_run_logs(), *count_run_totals()),
             "project_folder": state.get("project_folder", "unknown"),
@@ -1801,9 +2251,11 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
 
     @socketio.on("connect")
     def handle_connect():
-        state = load_state()
-        stats = compute_stats(state)
-        sio_emit("initial_state", stats)
+        # The pipeline UI pulls everything it needs over HTTP on load and
+        # asks for worker state explicitly (request_worker_status) — no
+        # initial_state push (that was the classic dashboard's protocol,
+        # and it cost a full stats compute per socket connect).
+        pass
 
     _scan_thread = None
 
@@ -1853,7 +2305,9 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
 
     def _project_folder():
         try:
-            return load_state().get("project_folder")
+            from fun_doc import get_state_meta
+
+            return get_state_meta().get("project_folder")
         except Exception:
             return None
 
@@ -1863,7 +2317,9 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
         to backfill the user's active binary first before walking the
         rest of the project tree."""
         try:
-            return load_state().get("active_binary")
+            from fun_doc import get_state_meta
+
+            return get_state_meta().get("active_binary")
         except Exception:
             return None
 
@@ -2041,16 +2497,143 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
             count = max(1, min(500, int((data or {}).get("count", 5))))
             model = (data or {}).get("model") or None
             binary = (data or {}).get("binary") or None
+            # The new pipeline UI drives the Document and Prove lanes through this
+            # event; Prove maps to the PORT (conformance) worker mode. Default stays
+            # "functions" (document) so the classic dashboard is unaffected.
+            mode = (data or {}).get("mode") or "functions"
+            if mode in ("document", "doc", "functions"):
+                mode = "functions"
             worker_id = worker_mgr.start_worker(
                 provider=provider,
                 count=count,
                 model=model,
                 binary=binary,
                 continuous=continuous,
+                mode=mode,
             )
-            sio_emit("worker_started_ack", {"worker_id": worker_id})
+            sio_emit("worker_started_ack", {"worker_id": worker_id, "mode": mode})
         except ValueError as e:
             sio_emit("worker_error", {"error": str(e)})
+
+    def _stream_proc(sid, label, program, args, cwd, env):
+        """Run a non-LLM tool as a background subprocess and stream its stdout to the
+        dashboard as triage_started/triage_line/triage_done events, so it shows as a
+        visible pane (these tools aren't WorkerManager workers). One pane per `sid`."""
+        import subprocess
+
+        def _run():
+            socketio.emit("triage_started", {"id": sid, "label": label, "program": program})
+            code, emitted = -1, 0
+            try:
+                proc = subprocess.Popen(args, cwd=cwd, env=env,
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        text=True, bufsize=1)
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if not line:
+                        continue
+                    # drop fun_doc/DB startup noise so the pane shows only the tool's work
+                    if ("slow_query" in line or line.startswith("[migrate]")
+                            or "Serving Flask" in line or "Debug mode" in line
+                            or "Running on http" in line or "Press CTRL" in line
+                            or "development server" in line or "Dashboard:" in line):
+                        continue
+                    emitted += 1
+                    socketio.emit("triage_line", {"id": sid, "text": line})
+                proc.wait()
+                code = proc.returncode
+            except Exception as e:
+                socketio.emit("triage_line", {"id": sid, "text": f"launch failed: {e}", "error": True})
+            socketio.emit("triage_done", {"id": sid, "code": code, "lines": emitted})
+            socketio.emit("conf_changed", {})   # tags may have changed -> dashboard re-reads
+
+        threading.Thread(target=_run, daemon=True, name=sid).start()
+
+    @socketio.on("request_load_types")
+    def handle_load_types(data):
+        """Load the UNIFIED type vocabulary into the focused binary: Fortification's PD2 structs
+        (the base, community names) + the D2MOO backfill/closure (data-table records + helpers PD2
+        lacks), then delete the D2MOO runtime duplicates so exactly ONE name set remains. Stamps the
+        unified marker. Streams progress; the slide-out bar collapses on success. Idempotent -- and
+        critically it can NEVER re-introduce the D2MOO duplicates (the delete pass runs every time)."""
+        program = (data or {}).get("binary") or (data or {}).get("program") or None
+        if not program:
+            sio_emit("types_load_done", {"ok": False, "error": "select a binary first"})
+            return
+
+        def job():
+            import conformance_dashboard as cd
+            import unify_types
+            try:
+                socketio.emit("types_load_progress", {"program": program,
+                    "text": "loading unified set: Fortification (base) + D2MOO backfill..."})
+                r = unify_types.load_unified(program)
+                socketio.emit("types_load_progress", {"program": program,
+                    "text": f"imported {r['added']} defs, removed {r['deleted_dups']} D2MOO duplicates"})
+                cd.types_cache_clear(program)
+                st = cd.types_status(program, force=True)
+                socketio.emit("types_load_done", {"ok": True, "program": program,
+                    "added": r["added"], "status": st})
+                socketio.emit("conf_changed", {})
+            except Exception as e:
+                socketio.emit("types_load_done", {"ok": False, "program": program, "error": str(e)})
+
+        socketio.start_background_task(job)
+        sio_emit("types_load_started", {"program": program})
+
+    @socketio.on("request_start_triage")
+    def handle_start_triage(data):
+        """Triage lane: run the conformance intake classify (scope-classify LIB_ + enqueue
+        the rest) over the focused binary. Scopes via FUNDOC_GHIDRA_PROGRAM; --apply/--count.
+        Path configurable via CONF_TRIAGE_TOOL."""
+        program = (data or {}).get("binary") or (data or {}).get("program") or None
+        tool = os.environ.get(
+            "CONF_TRIAGE_TOOL",
+            str(Path(__file__).resolve().parents[3] / "cpp" / "D2MOO"
+                / "conformance" / "tools" / "triage.py"),
+        )
+        if not Path(tool).exists():
+            sio_emit("worker_error", {"error": f"triage tool not found: {tool} (set CONF_TRIAGE_TOOL)"})
+            return
+        env = dict(os.environ)
+        if program:
+            env["FUNDOC_GHIDRA_PROGRAM"] = program
+        args = [sys.executable, "-u", tool, "--apply"]
+        cnt = (data or {}).get("count")
+        if cnt:
+            try:
+                args += ["--count", str(int(cnt))]
+            except (TypeError, ValueError):
+                pass
+        _stream_proc("triage", "triage", program, args, str(Path(tool).parent), env)
+        sio_emit("worker_started_ack", {"mode": "triage", "program": program})
+
+    @socketio.on("request_start_assess")
+    def handle_start_assess(data):
+        """Assess lane: score in-scope functions' current documentation and stamp DOC_DRAFT
+        on the already-documented ones (fun_doc.py --assess). Only scores functions without
+        a DOC rung yet, so repeat passes shrink the pool. Streams per-function progress."""
+        program = (data or {}).get("binary") or (data or {}).get("program") or None
+        if not program:
+            sio_emit("worker_error", {"error": "assess requires a binary -- select one in the header."})
+            return
+        fun_doc_py = str(Path(__file__).resolve().parent / "fun_doc.py")
+        args = [sys.executable, "-u", fun_doc_py, "--assess", "--binary", program]
+        # "All" (continuous) -> no --assess-count so run_assess_pass scores EVERY candidate
+        cnt = (data or {}).get("count")
+        if cnt and not (data or {}).get("continuous"):
+            try:
+                args += ["--assess-count", str(int(cnt))]
+            except (TypeError, ValueError):
+                pass
+        # DOC_DRAFT threshold now IS the Target (good_enough_score): fully-drafted
+        # == met the Target. Omit --draft-score so run_assess_pass resolves the live
+        # good_enough_score itself, keeping the batch sweep and the live per-function
+        # auto-stamp on one threshold.
+        env = dict(os.environ)
+        env["FUNDOC_DASHBOARD"] = "false"   # belt-and-suspenders: never spawn a nested dashboard
+        _stream_proc("assess", "assess", program, args, str(Path(fun_doc_py).parent), env)
+        sio_emit("worker_started_ack", {"mode": "assess", "program": program})
 
     @socketio.on("request_start_globals_worker")
     def handle_start_globals_worker(data):
@@ -2094,18 +2677,25 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
 
     # --- HTTP routes ---
 
+    # The confidence/pipeline dashboard is the only UI; /pipeline is kept
+    # as an alias so bookmarks, Playwright specs, and script instructions
+    # that predate the root swap keep working. (The classic dashboard.html
+    # and its SSR stats path were removed 2026-07-17.)
     @app.route("/")
-    def dashboard():
-        state = load_state()
-        stats = compute_stats(state)
-        return render_template("dashboard.html", stats=stats)
+    @app.route("/pipeline")
+    def pipeline_dashboard():
+        return render_template("pipeline.html")
+
+    try:
+        from conformance_api import conf_bp
+        if "conformance" not in app.blueprints:
+            app.register_blueprint(conf_bp)
+    except Exception as _e:
+        print(f"  (conformance blueprint not registered: {_e})", flush=True)
 
     @app.route("/api/stats")
     def api_stats():
-        state = load_state()
-        stats = compute_stats(state)
-        stats.pop("all_functions", None)
-        return jsonify(stats)
+        return jsonify(get_stats_snapshot())
 
     @app.route("/api/_diag_bridge")
     def api_diag_bridge():
@@ -2129,12 +2719,52 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
     def get_queue():
         return jsonify(load_queue())
 
+    def _resolve_queue_key(data):
+        """Resolve a request body to the canonical priority-queue key
+        ('<program>::<addr>', addr = bare lowercase hex). Accepts either an
+        explicit {key} (legacy) or {program, address}. The frontend can't
+        reliably reconstruct the key (program carries a '.0' suffix, address
+        may be '0x'-prefixed), so we match against the real state keys here."""
+        key = data.get("key")
+        if key:
+            return key
+        address = data.get("address")
+        if not address:
+            return None
+        addr = str(address).strip().lower()
+        if addr.startswith("0x"):
+            addr = addr[2:]
+        program = data.get("program")
+        try:
+            funcs = load_state().get("functions", {})
+        except Exception:
+            funcs = {}
+        # 1) exact program::addr
+        if program:
+            cand = f"{program}::{addr}"
+            if cand in funcs:
+                return cand
+        # 2) unique state key ending in ::addr (optionally within same binary)
+        suffix = f"::{addr}"
+        matches = [k for k in funcs if k.endswith(suffix)]
+        if program and len(matches) > 1:
+            base = os.path.basename(program).split(".dll")[0]
+            pref = [k for k in matches if base and base in k]
+            if pref:
+                matches = pref
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            return matches[0]
+        # 3) last resort: best-effort key so the pin still records intent
+        return f"{program}::{addr}" if program else None
+
     @app.route("/api/queue/pin", methods=["POST"])
     def pin_function():
         data = request.json
-        key = data.get("key")
+        key = _resolve_queue_key(data)
         if not key:
-            return jsonify({"error": "key required"}), 400
+            return jsonify({"error": "key or program+address required"}), 400
         queue = load_queue()
         if key not in queue["pinned"]:
             queue["pinned"].append(key)
@@ -2195,8 +2825,11 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
                                 response["status"] = "already_done"
                                 response["good_enough"] = good_enough
         except Exception as e:
-            response = {"ok": True, "status": "queued", "score_error": str(e)}
+            print(f"[web] pin scoring failed: {e}")
+            traceback.print_exc()
+            response = {"ok": True, "status": "queued", "score_error": "scoring failed; see server log"}
 
+        response["key"] = key
         socketio.emit(
             "queue_changed",
             {"action": "pin", "key": key, "status": response.get("status")},
@@ -2206,14 +2839,21 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
     @app.route("/api/queue/unpin", methods=["POST"])
     def unpin_function():
         data = request.json
-        key = data.get("key")
+        key = _resolve_queue_key(data)
         if not key:
-            return jsonify({"error": "key required"}), 400
+            return jsonify({"error": "key or program+address required"}), 400
+        # Drop the resolved key AND any stored key for the same address, so an
+        # unpin succeeds even if the pin was recorded under a different program
+        # spelling.
+        addr_suffix = "::" + key.split("::", 1)[1] if "::" in key else None
         queue = load_queue()
-        queue["pinned"] = [k for k in queue["pinned"] if k != key]
+        queue["pinned"] = [
+            k for k in queue["pinned"]
+            if k != key and not (addr_suffix and k.endswith(addr_suffix))
+        ]
         save_queue(queue)
         socketio.emit("queue_changed", {"action": "unpin", "key": key})
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "key": key})
 
     @app.route("/api/queue/drain_done", methods=["POST"])
     def drain_done():
@@ -2228,7 +2868,9 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
             socketio.emit("queue_changed", {"action": "drain_done", **result})
             return jsonify({"ok": True, **result})
         except Exception as e:
-            return jsonify({"error": str(e)}), 500
+            print(f"[web] drain_done failed: {e}")
+            traceback.print_exc()
+            return jsonify({"error": "Internal error; see server log."}), 500
 
     @app.route("/api/queue/refresh", methods=["POST"])
     def refresh_candidates():
@@ -2262,6 +2904,71 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
         threading.Thread(target=run_refresh, daemon=True).start()
         return jsonify({"ok": True, "scheduled": True, "count": count})
 
+    @app.route("/api/worker/start", methods=["POST"])
+    def http_start_worker():
+        """HTTP twin of the socket.io `request_start_worker` /
+        `request_start_globals_worker` handlers (backlog #12): autonomous
+        launchers shouldn't depend on socket.io namespace stability. Body:
+        {mode, provider, count, model, binary, continuous}. mode "globals"
+        routes through the same WorkerManager path as the globals button."""
+        data = request.get_json(silent=True) or {}
+        try:
+            provider = data.get("provider", "minimax")
+            continuous = bool(data.get("continuous", False))
+            count = max(1, min(500, int(data.get("count", 5))))
+            model = data.get("model") or None
+            binary = data.get("binary") or None
+            mode = data.get("mode") or "functions"
+            if mode in ("document", "doc", "functions"):
+                mode = "functions"
+            worker_id = worker_mgr.start_worker(
+                provider=provider,
+                count=count,
+                model=model,
+                binary=binary,
+                continuous=continuous,
+                mode=mode,
+            )
+            return jsonify({"ok": True, "worker_id": worker_id, "mode": mode})
+        except ValueError as e:
+            # Controlled launch-rejection messages (per-binary lock, unknown
+            # provider) — safe and useful to surface to the caller. Every
+            # ValueError raised by WorkerManager.start_worker builds its
+            # message from fixed literals plus fields the caller supplied in
+            # this same request (provider name, binary path) — never
+            # server-internal state. CodeQL's stack-trace-exposure query
+            # can't prove that from the taint flow alone, so this is a
+            # reviewed false positive; suppressed rather than degraded to a
+            # generic 500 that would hide genuinely actionable feedback.
+            return jsonify({"ok": False, "error": str(e)}), 409  # codeql[py/stack-trace-exposure]
+        except Exception:  # noqa: BLE001
+            app.logger.exception("HTTP worker start failed")
+            return jsonify({"ok": False, "error": "internal error -- see dashboard server log"}), 500
+
+    @app.route("/api/worker/stop", methods=["POST"])
+    def http_stop_worker():
+        """HTTP twin of `request_stop_worker`. Body: {worker_id}."""
+        data = request.get_json(silent=True) or {}
+        wid = data.get("worker_id")
+        if not wid:
+            return jsonify({"ok": False, "error": "worker_id is required"}), 400
+        try:
+            worker_mgr.stop_worker(wid)
+            return jsonify({"ok": True, "worker_id": wid})
+        except Exception:  # noqa: BLE001
+            app.logger.exception("HTTP worker stop failed for %r", wid)
+            return jsonify({"ok": False, "error": "internal error -- see dashboard server log"}), 500
+
+    @app.route("/api/worker/status", methods=["GET"])
+    def http_worker_status():
+        """Worker roster snapshot (same payload as the `worker_status` socket
+        event) so headless operators can poll instead of holding a socket."""
+        try:
+            return jsonify({"ok": True, "workers": worker_mgr.get_status()})
+        except Exception:  # noqa: BLE001
+            app.logger.exception("HTTP worker status failed")
+            return jsonify({"ok": False, "error": "internal error -- see dashboard server log"}), 500
+
     @app.route("/api/queue/config", methods=["GET", "POST"])
     def queue_config():
         from fun_doc import DEFAULT_QUEUE_CONFIG
@@ -2284,6 +2991,11 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
                     )
             if "require_scored" in data:
                 cfg["require_scored"] = bool(data["require_scored"])
+            if "plate_scaffold" in data:
+                cfg["plate_scaffold"] = bool(data["plate_scaffold"])
+            # assess_draft_score retired: the DOC_DRAFT threshold is now the Target
+            # (good_enough_score). A stale key posted by an old client is ignored.
+            cfg.pop("assess_draft_score", None)
             if "complexity_handoff_provider" in data:
                 v = data["complexity_handoff_provider"]
                 if v in (None, "", "none", "off"):
@@ -2428,9 +3140,11 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
                     print(f"  Global scorer toggle failed: {_exc}")
             queue["config"] = cfg
             save_queue(queue)
-            socketio.emit("queue_changed", {"action": "config", "config": cfg})
-            return jsonify({"ok": True, "config": cfg})
-        return jsonify({"config": queue.get("config", dict(DEFAULT_QUEUE_CONFIG))})
+            safe_cfg = _redact_config_secrets(cfg)
+            socketio.emit("queue_changed", {"action": "config", "config": safe_cfg})
+            return jsonify({"ok": True, "config": safe_cfg})
+        return jsonify({"config": _redact_config_secrets(
+            queue.get("config", dict(DEFAULT_QUEUE_CONFIG)))})
 
     @app.route("/api/inventory/status", methods=["GET"])
     def inventory_status():
@@ -2512,7 +3226,9 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
                 }
             )
         except Exception as exc:  # noqa: BLE001
-            return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+            print(f"[web] inventory_status failed: {exc}")
+            traceback.print_exc()
+            return jsonify({"error": "Internal error; see server log."}), 500
 
     @app.route("/api/inventory/toggle", methods=["POST"])
     def inventory_toggle():
@@ -2577,7 +3293,9 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
             socketio.emit("inventory_reset", {"ok": True, "path": path})
             return jsonify({"ok": True, "removed": removed, "path": path})
         except Exception as exc:  # noqa: BLE001
-            return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+            print(f"[web] inventory_reset failed: {exc}")
+            traceback.print_exc()
+            return jsonify({"error": "Internal error; see server log."}), 500
 
     # --- Global-variable inventory (v5.7.0) ---
 
@@ -2592,8 +3310,11 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
             blacklist = set(scorer_status.get("blacklisted") or [])
 
             from global_scorer import status_for as _global_status_for
+            from global_scorer import _is_phantom_program_name
             binaries = []
             for path, rec in persisted.items():
+                if _is_phantom_program_name(rec.get("name") or Path(path).name):
+                    continue  # skip D2Launch.dll.0-style versioned phantoms
                 total = rec.get("total_documentable", 0) or 0
                 fully = rec.get("fully_documented", 0) or 0
                 with_issues = max(0, total - fully)
@@ -2610,6 +3331,14 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
                     "percent": pct,
                     "last_scan": rec.get("last_scan"),
                     "status": row_status,
+                    # Category breakdown from classify_documented (v2 bar).
+                    # Absent on records stamped by an older scorer.
+                    "pending": rec.get("pending"),
+                    "soft_only": rec.get("soft_only"),
+                    "os_canonical": rec.get("os_canonical"),
+                    "code_labels": rec.get("code_label"),
+                    "clean": rec.get("clean"),
+                    "rules_version": rec.get("rules_version"),
                 })
             binaries.sort(key=lambda r: r["name"], reverse=True)
             binaries.sort(key=lambda r: r["with_issues"], reverse=True)
@@ -2617,6 +3346,10 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
                 "total_documentable": sum(r["total_documentable"] for r in binaries),
                 "fully_documented": sum(r["fully_documented"] for r in binaries),
                 "with_issues": sum(r["with_issues"] for r in binaries),
+                "pending": sum(r.get("pending") or 0 for r in binaries),
+                "soft_only": sum(r.get("soft_only") or 0 for r in binaries),
+                "os_canonical": sum(r.get("os_canonical") or 0 for r in binaries),
+                "code_labels": sum(r.get("code_labels") or 0 for r in binaries),
                 "binaries_total": len(binaries),
                 "binaries_complete": sum(
                     1 for r in binaries if r["status"] == "complete"
@@ -2628,7 +3361,9 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
                 "binaries": binaries,
             })
         except Exception as exc:  # noqa: BLE001
-            return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+            print(f"[web] global_inventory_status failed: {exc}")
+            traceback.print_exc()
+            return jsonify({"error": "Internal error; see server log."}), 500
 
     @app.route("/api/global_inventory/toggle", methods=["POST"])
     def global_inventory_toggle():
@@ -2679,8 +3414,29 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
             global_scorer.clear_blacklist(path)
             socketio.emit("global_inventory_reset", {"ok": True, "path": path})
             return jsonify({"ok": True, "removed": removed, "path": path})
-        except Exception as exc:  # noqa: BLE001
-            return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+        except Exception:  # noqa: BLE001
+            app.logger.exception("global inventory reset failed")
+            return jsonify({"error": "internal error -- see dashboard server log"}), 500
+
+    @app.route("/api/global_inventory/reset_all", methods=["POST"])
+    def global_inventory_reset_all():
+        """Bulk reset: drop EVERY binary's inventory record so the scorer
+        re-walks the whole project under the current counting rules.
+        Companion to the per-binary ↻ — a rules change used to require 31
+        individual clicks (or waiting out an hour-long cooldown apiece)."""
+        try:
+            inv_dir = Path(__file__).parent
+            data_inv = load_global_inventory(inv_dir)
+            removed = len(data_inv.get("binaries") or {})
+            data_inv["binaries"] = {}
+            from global_scorer import save_inventory as _save_g_inv
+            _save_g_inv(inv_dir, data_inv)
+            global_scorer.clear_blacklist(None)
+            socketio.emit("global_inventory_reset", {"ok": True, "path": None})
+            return jsonify({"ok": True, "removed": removed})
+        except Exception:  # noqa: BLE001
+            app.logger.exception("global inventory reset_all failed")
+            return jsonify({"error": "internal error -- see dashboard server log"}), 500
 
     # --- Provider quota pauses (Q1-Q11) ---
     from provider_pause import get_default_manager as _get_pause_mgr
@@ -2733,226 +3489,6 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
     if restored_workers:
         print(f"  Restored {len(restored_workers)} dashboard worker(s) after restart")
 
-    @app.route("/api/functions/search", methods=["GET"])
-    def search_functions():
-        """Search across the full state.functions map without the 500-row dashboard cap."""
-        q = (request.args.get("q") or "").strip().lower()
-        program = request.args.get("program") or None
-        layer_filter = request.args.get("layer")  # "0", "1", ..., "cyclic", or None
-        try:
-            limit = max(1, min(10000, int(request.args.get("limit", 5000))))
-        except ValueError:
-            limit = 5000
-        sort = request.args.get("sort", "score")
-        state = load_state()
-        all_funcs = state.get("functions", {})
-        queue = load_queue()
-        good_enough = queue.get("config", {}).get("good_enough_score", 80)
-        pinned = set(queue.get("pinned", []))
-
-        results = []
-        for key, func in all_funcs.items():
-            if func.get("is_thunk") or func.get("is_external"):
-                continue
-            if program and func.get("program_name") != program:
-                continue
-            # Layer filter — computed dynamically using the same BFS as
-            # /api/call_graph_layers so results match the dashboard exactly.
-            # The pre-computed call_graph_layer in state.json can diverge
-            # because populate_call_graph includes thunks in the adjacency
-            # set while the dashboard excludes them.
-            if layer_filter is not None:
-                if not hasattr(search_functions, "_layer_cache"):
-                    search_functions._layer_cache = {}
-                cache_key = (program or state.get("active_binary"), layer_filter)
-                if cache_key not in search_functions._layer_cache:
-                    # Build layer map matching the dashboard's BFS
-                    active_bin = program or state.get("active_binary")
-                    bf = {
-                        k: v
-                        for k, v in all_funcs.items()
-                        if v.get("program_name") == active_bin
-                        and not v.get("is_thunk")
-                        and not v.get("is_external")
-                    }
-                    sa = set()
-                    for v in bf.values():
-                        sa.add(v.get("address", ""))
-                    co = {}
-                    cr = defaultdict(set)
-                    for v in bf.values():
-                        a = v.get("address", "")
-                        ic = set(v.get("callees", [])) & sa
-                        co[a] = ic
-                        for c in ic:
-                            cr[c].add(a)
-                    dp = {}
-                    cur = {a for a in sa if not co.get(a)}
-                    for a in cur:
-                        dp[a] = 0
-                    ln = 0
-                    while cur:
-                        nx = set()
-                        for a in cur:
-                            for ca in cr.get(a, set()):
-                                if ca in dp:
-                                    continue
-                                if all(c in dp for c in co.get(ca, set())):
-                                    dp[ca] = ln + 1
-                                    nx.add(ca)
-                        cur = nx
-                        ln += 1
-                        if ln > 200:
-                            break
-                    lm = {}
-                    for a in sa:
-                        lm[a] = dp.get(a)  # None = cyclic
-                    search_functions._layer_cache[cache_key] = lm
-                lm = search_functions._layer_cache[cache_key]
-                func_layer = lm.get(func.get("address", ""))
-                if layer_filter == "cyclic":
-                    if func_layer is not None:
-                        continue
-                else:
-                    try:
-                        target_layer = int(layer_filter)
-                    except ValueError:
-                        target_layer = -1
-                    if func_layer != target_layer:
-                        continue
-            if q:
-                name = func.get("name", "").lower()
-                addr = str(func.get("address", "")).lower()
-                if q not in name and q not in addr:
-                    continue
-            # Compute deps remaining
-            callees = func.get("callees", [])
-            if not callees:
-                deps_remaining = 0
-            else:
-                prog = func.get("program")
-                deps_remaining = sum(
-                    1
-                    for ca in callees
-                    if (cf := all_funcs.get(f"{prog}::{ca}"))
-                    and cf.get("score", 0) < good_enough
-                )
-            results.append(
-                {
-                    "key": key,
-                    "name": func.get("name", ""),
-                    "address": func.get("address", ""),
-                    "program": func.get("program_name", ""),
-                    "score": func.get("score", 0),
-                    "fixable": round(func.get("fixable", 0), 1),
-                    "callers": func.get("caller_count", 0),
-                    "is_leaf": not callees,
-                    "call_graph_layer": func.get("call_graph_layer"),
-                    "deps_remaining": deps_remaining,
-                    "last_result": func.get("last_result"),
-                    "pinned": key in pinned,
-                    "unscored": not func.get("last_processed"),
-                    "tool_calls": func.get("tool_calls"),
-                    "tool_calls_known": func.get("tool_calls_known"),
-                    # Provenance (#204) — see compute_skip_reason() for the
-                    # selector-mirror logic. `name_source_binary` is the
-                    # forensic "where did this name come from?" pointer.
-                    "name_source": func.get("name_source") or "scan",
-                    "name_source_binary": func.get("name_source_binary"),
-                    "name_confidence": func.get("name_confidence"),
-                    "skip_reason": compute_skip_reason(func, key, pinned),
-                }
-            )
-        if sort == "name":
-            results.sort(key=lambda r: r["name"].lower())
-        elif sort == "name_desc":
-            results.sort(key=lambda r: r["name"].lower(), reverse=True)
-        elif sort == "address":
-            results.sort(key=lambda r: r.get("address", ""))
-        elif sort == "address_desc":
-            results.sort(key=lambda r: r.get("address", ""), reverse=True)
-        elif sort == "status":
-            # Sort by score bucket: unscored first, then NEW (<70), FIX (70-79), DONE (80+)
-            def _status_key(r):
-                if r.get("unscored"):
-                    return 0
-                s = r.get("score", 0)
-                if s >= 80:
-                    return 3
-                if s >= 70:
-                    return 2
-                return 1
-
-            results.sort(key=_status_key)
-        elif sort == "status_desc":
-
-            def _status_key_desc(r):
-                if r.get("unscored"):
-                    return 0
-                s = r.get("score", 0)
-                if s >= 80:
-                    return 3
-                if s >= 70:
-                    return 2
-                return 1
-
-            results.sort(key=_status_key_desc, reverse=True)
-        elif sort == "score_desc":
-            results.sort(key=lambda r: -r["score"])
-        elif sort == "fixable":
-            results.sort(key=lambda r: -r["fixable"])
-        elif sort == "fixable_desc":
-            results.sort(key=lambda r: r["fixable"])
-        elif sort == "deps_asc":
-            results.sort(key=lambda r: (r.get("deps_remaining", 0), r["score"]))
-        elif sort == "deps_desc":
-            results.sort(key=lambda r: (-r.get("deps_remaining", 0), r["score"]))
-        elif sort == "layer":
-            results.sort(
-                key=lambda r: (
-                    (
-                        r.get("call_graph_layer")
-                        if r.get("call_graph_layer") is not None
-                        else 999
-                    ),
-                    r["score"],
-                )
-            )
-        elif sort == "tools":
-            # Most tool calls first; unmeasured (-1 / None) sort to bottom.
-            def _tools_key(r):
-                tc = r.get("tool_calls")
-                if tc is None or tc < 0:
-                    return (1, 0)
-                return (0, -tc)
-
-            results.sort(key=_tools_key)
-        elif sort == "tools_desc":
-            def _tools_key_desc(r):
-                tc = r.get("tool_calls")
-                if tc is None or tc < 0:
-                    return (1, 0)
-                return (0, tc)
-
-            results.sort(key=_tools_key_desc)
-        elif sort == "layer_desc":
-            results.sort(
-                key=lambda r: (
-                    -(
-                        r.get("call_graph_layer")
-                        if r.get("call_graph_layer") is not None
-                        else -1
-                    ),
-                    -r["score"],
-                )
-            )
-        else:  # "score" (default — lowest first)
-            results.sort(key=lambda r: r["score"])
-        total_match = len(results)
-        return jsonify(
-            {"total": total_match, "results": results[:limit], "limit": limit}
-        )
-
     # --- Folder / binary selection ---
 
     # TTL cache for Ghidra HTTP fetchers. Both _fetch_project_binaries and
@@ -3003,35 +3539,20 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
         except Exception:
             return []
 
-    @app.route("/api/navigate", methods=["POST"])
-    def navigate_ghidra():
-        """Navigate Ghidra to a specific address."""
-        from fun_doc import ghidra_post
-
-        data = request.get_json() or {}
-        address = data.get("address", "")
-        if not address:
-            return jsonify({"error": "address required"}), 400
-        ghidra_post("/tool/goto_address", data={"address": f"0x{address}"})
-        return jsonify({"ok": True, "address": address})
-
     @app.route("/api/context", methods=["GET"])
     def get_context():
-        state = load_state()
-        folder = state.get("project_folder", "/")
+        # Meta + DISTINCT query only — no functions materialization.
+        from fun_doc import get_state_meta, list_scanned_binaries
+
+        meta = get_state_meta()
+        folder = meta.get("project_folder") or "/"
         # Merge: project files from Ghidra + any binaries already scanned
         project_binaries = _fetch_project_binaries(folder)
-        scanned_binaries = sorted(
-            set(
-                f.get("program_name", "unknown")
-                for f in state.get("functions", {}).values()
-            )
-        )
-        all_binaries = sorted(set(project_binaries + scanned_binaries))
+        all_binaries = sorted(set(project_binaries + list_scanned_binaries()))
         return jsonify(
             {
                 "project_folder": folder,
-                "active_binary": state.get("active_binary"),
+                "active_binary": meta.get("active_binary"),
                 "available_binaries": all_binaries,
             }
         )
@@ -3046,7 +3567,82 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
 
             return jsonify(cw.coverage_summary())
         except Exception as exc:  # noqa: BLE001 - report, don't 500 the dashboard
-            return jsonify({"error": str(exc), "total_ported": 0, "by_program": {}})
+            print(f"[web] coverage_summary failed: {exc}")
+            traceback.print_exc()
+            return jsonify({"error": "coverage unavailable", "total_ported": 0, "by_program": {}})
+
+    @app.route("/api/conformance/pipeline", methods=["GET"])
+    def conformance_pipeline():
+        """Port pipeline (Stage 2/3) candidates currently in flight --
+        drafted, vectors minted, harness failed, or proven-pending-review.
+
+        Distinct from /api/conformance/coverage: coverage reflects OpenD2's
+        COMMITTED @PD2S12 markers (source of truth = the OpenD2 repo).
+        This reflects fun-doc's own port_status tracking for candidates a
+        human has NOT yet reviewed/promoted into Shared/ -- the automated
+        pipeline never writes @PD2S12 markers itself (see port_pipeline.py's
+        module docstring: it stages and proves, a human integrates)."""
+        try:
+            state = load_state()
+            candidates = []
+            for key, func in state.get("functions", {}).items():
+                status = func.get("port_status")
+                if not status:
+                    continue
+                candidates.append({
+                    "key": key,
+                    "program": func.get("program"),
+                    "program_name": func.get("program_name"),
+                    "address": func.get("address"),
+                    "name": func.get("name"),
+                    "port_status": status,
+                    "port_attempts": func.get("port_attempts", 0),
+                    "port_draft_path": func.get("port_draft_path"),
+                    "port_last_result": func.get("port_last_result"),
+                })
+            # Surface what needs your attention first: a ready-to-review
+            # proven draft, then failures worth investigating, then
+            # in-flight/blocked states.
+            order = {
+                "proven_pending_review": 0,
+                "harness_failed": 1,
+                "no_vectors": 2,
+                "malformed_response": 2,
+                "blocked": 3,
+            }
+            candidates.sort(key=lambda c: order.get(c["port_status"], 9))
+            return jsonify({"candidates": candidates})
+        except Exception:  # noqa: BLE001 - report, don't 500 the dashboard
+            app.logger.exception("conformance pipeline listing failed")
+            return jsonify({"error": "internal error -- see dashboard server log",
+                            "candidates": []})
+
+    @app.route("/api/conformance/draft_content", methods=["GET"])
+    def conformance_draft_content():
+        """Read a staged draft header's raw content for review, given the
+        port_draft_path from /api/conformance/pipeline. Path-restricted to
+        OpenD2's _generated_candidates/ staging dir -- never serves an
+        arbitrary filesystem path even if a stale/tampered port_draft_path
+        somehow pointed elsewhere."""
+        raw_path = request.args.get("path", "")
+        if not raw_path:
+            return jsonify({"error": "path required"}), 400
+        try:
+            import port_pipeline as pp
+
+            # realpath + prefix barrier: resolves symlinks and ../ before the
+            # containment check, so no post-check re-resolution can escape.
+            allowed_root = os.path.realpath(str(pp.GENERATED_CANDIDATES_DIR))
+            candidate = os.path.realpath(raw_path)
+            if not candidate.startswith(allowed_root + os.sep):
+                return jsonify({"error": "path outside the staged-candidates directory"}), 403
+            if not os.path.isfile(candidate):
+                return jsonify({"error": "file not found (may have been overwritten by a newer candidate)"}), 404
+            with open(candidate, "r", encoding="utf-8") as f:
+                return jsonify({"path": candidate, "content": f.read()})
+        except Exception:  # noqa: BLE001
+            app.logger.exception("draft_content failed for %r", raw_path)
+            return jsonify({"error": "internal error -- see dashboard server log"}), 500
 
     @app.route("/api/conformance/sidebyside", methods=["GET"])
     def conformance_sidebyside():
@@ -3062,30 +3658,34 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
 
             return jsonify(cw.get_sidebyside(program, address))
         except Exception as exc:  # noqa: BLE001
-            return jsonify({"error": str(exc)}), 500
+            print(f"[web] get_sidebyside failed: {exc}")
+            traceback.print_exc()
+            return jsonify({"error": "Internal error; see server log."}), 500
 
     @app.route("/api/context/binary", methods=["POST"])
     def set_active_binary():
+        # Meta-only write. This used to load_state() + _save_state_inline(),
+        # i.e. read AND bulk-upsert every functions_workflow row (~52 s on a
+        # 60K-row store) just to flip one pointer — the binary-switch stall.
+        from fun_doc import set_state_meta
+
         data = request.json
-        binary = data.get("binary")  # None or "" to clear filter
-        state = load_state()
-        if binary:
-            state["active_binary"] = binary
-        else:
-            state.pop("active_binary", None)
-        _save_state_inline(state)
+        binary = data.get("binary") or None  # None or "" to clear filter
+        set_state_meta(active_binary=binary)
+        _invalidate_stats_cache()
         socketio.emit("state_changed")
-        return jsonify({"ok": True, "active_binary": state.get("active_binary")})
+        return jsonify({"ok": True, "active_binary": binary})
 
     @app.route("/api/context/folder", methods=["POST"])
     def set_project_folder():
+        from fun_doc import set_state_meta
+
         data = request.json
         folder = data.get("folder")
         if not folder:
             return jsonify({"error": "folder required"}), 400
-        state = load_state()
-        state["project_folder"] = folder
-        _save_state_inline(state)
+        set_state_meta(project_folder=folder)
+        _invalidate_stats_cache()
         socketio.emit("state_changed")
         return jsonify({"ok": True, "project_folder": folder})
 
@@ -3132,196 +3732,6 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
     def get_available_folders():
         return jsonify({"folders": _fetch_project_folders()})
 
-    @app.route("/api/call_graph_layers", methods=["GET"])
-    def call_graph_layers():
-        """Compute call-graph layer assignment and per-layer completion stats.
-
-        Uses BFS from leaf functions (layer 0) upward through callers.
-        Functions in call cycles that can't be reached by BFS are grouped
-        into a final "cyclic" bucket and ordered internally by callee
-        readiness.
-        """
-        from fun_doc import _callee_readiness
-
-        state = load_state()
-        active_binary = state.get("active_binary")
-        all_funcs = state.get("functions", {})
-        queue = load_queue()
-        good_enough = queue.get("config", {}).get("good_enough_score", 80)
-
-        # Filter to active binary, non-thunk only
-        if active_binary:
-            funcs = {
-                k: v
-                for k, v in all_funcs.items()
-                if v.get("program_name") == active_binary
-                and not v.get("is_thunk")
-                and not v.get("is_external")
-            }
-        else:
-            funcs = {
-                k: v
-                for k, v in all_funcs.items()
-                if not v.get("is_thunk") and not v.get("is_external")
-            }
-
-        # Build adjacency: address → [callee addresses]
-        addr_to_key = {}
-        callees_of = {}  # addr → set of callee addrs
-        callers_of = defaultdict(set)  # addr → set of caller addrs
-        all_addrs = set()
-
-        for key, func in funcs.items():
-            addr = func.get("address", "")
-            addr_to_key[addr] = key
-            all_addrs.add(addr)
-            callee_addrs = set(func.get("callees", []))
-            # Filter to only callees that are in this binary's function set
-            internal_callees = callee_addrs & all_addrs
-            callees_of[addr] = internal_callees
-            for c in internal_callees:
-                callers_of[c].add(addr)
-
-        # BFS layer assignment from leaves
-        depth = {}
-        current_layer = set()
-        for addr in all_addrs:
-            if not callees_of.get(addr):
-                depth[addr] = 0
-                current_layer.add(addr)
-
-        layer_num = 0
-        while current_layer:
-            next_layer = set()
-            for addr in current_layer:
-                for caller in callers_of.get(addr, set()):
-                    if caller in depth:
-                        continue
-                    # Assign when ALL callees have a depth
-                    if all(c in depth for c in callees_of.get(caller, set())):
-                        depth[caller] = layer_num + 1
-                        next_layer.add(caller)
-            current_layer = next_layer
-            layer_num += 1
-            if layer_num > 200:
-                break
-
-        # Build per-layer stats
-        max_depth = max(depth.values()) if depth else 0
-        layers = []
-        for d in range(max_depth + 1):
-            layer_addrs = [a for a, dep in depth.items() if dep == d]
-            total = len(layer_addrs)
-            done = sum(
-                1
-                for a in layer_addrs
-                if a in addr_to_key
-                and funcs[addr_to_key[a]].get("score", 0) >= good_enough
-            )
-            # "Ready" = callees all documented AND not yet done itself
-            ready = 0
-            for a in layer_addrs:
-                if a not in addr_to_key:
-                    continue
-                func = funcs[addr_to_key[a]]
-                if func.get("score", 0) >= good_enough:
-                    continue  # already done
-                readiness = _callee_readiness(func, all_funcs, good_enough)
-                if readiness >= 1.0:
-                    ready += 1
-            layers.append(
-                {
-                    "depth": d,
-                    "label": "Leaves" if d == 0 else f"Layer {d}",
-                    "total": total,
-                    "done": done,
-                    "pct": round(100 * done / total, 1) if total > 0 else 0,
-                    "ready": ready,
-                }
-            )
-
-        # Cyclic bucket: everything not assigned a depth
-        cyclic_addrs = [a for a in all_addrs if a not in depth]
-        if cyclic_addrs:
-            done = sum(
-                1
-                for a in cyclic_addrs
-                if a in addr_to_key
-                and funcs[addr_to_key[a]].get("score", 0) >= good_enough
-            )
-            ready = 0
-            for a in cyclic_addrs:
-                if a not in addr_to_key:
-                    continue
-                func = funcs[addr_to_key[a]]
-                if func.get("score", 0) >= good_enough:
-                    continue
-                readiness = _callee_readiness(func, all_funcs, good_enough)
-                if readiness >= 0.8:
-                    ready += 1
-            layers.append(
-                {
-                    "depth": max_depth + 1,
-                    "label": "Cyclic",
-                    "total": len(cyclic_addrs),
-                    "done": done,
-                    "pct": (
-                        round(100 * done / len(cyclic_addrs), 1) if cyclic_addrs else 0
-                    ),
-                    "ready": ready,
-                }
-            )
-
-        return jsonify(
-            {
-                "layers": layers,
-                "total_functions": len(funcs),
-                "assigned": len(depth),
-                "cyclic": len(all_addrs) - len(depth),
-                "max_depth": max_depth,
-            }
-        )
-
-    @app.route("/api/cross_binary_progress", methods=["GET"])
-    def cross_binary_progress():
-        """Cross-binary progress summary — all binaries in the current folder."""
-        state = load_state()
-        all_funcs = state.get("functions", {})
-        by_binary = defaultdict(
-            lambda: {
-                "total": 0,
-                "done": 0,
-                "fixable": 0,
-                "needs_work": 0,
-                "avg_score": 0,
-                "total_fixable_pts": 0,
-            }
-        )
-        for f in all_funcs.values():
-            prog = f.get("program_name", "unknown")
-            score = f.get("score", 0)
-            by_binary[prog]["total"] += 1
-            if score >= 90:
-                by_binary[prog]["done"] += 1
-            elif score >= 70:
-                by_binary[prog]["fixable"] += 1
-            else:
-                by_binary[prog]["needs_work"] += 1
-            by_binary[prog]["avg_score"] += score
-            by_binary[prog]["total_fixable_pts"] += f.get("fixable", 0)
-        result = []
-        for prog, info in sorted(by_binary.items()):
-            info["avg_score"] = (
-                round(info["avg_score"] / info["total"], 1) if info["total"] > 0 else 0
-            )
-            info["total_fixable_pts"] = round(info["total_fixable_pts"], 0)
-            info["pct_done"] = (
-                round(info["done"] / info["total"] * 100, 1) if info["total"] > 0 else 0
-            )
-            info["name"] = prog
-            result.append(info)
-        return jsonify({"binaries": result})
-
     # Pre-warm both caches at startup so the FIRST user request to / or
     # /api/stats lands on warm cache instead of paying the recursive Ghidra
     # walk + PG pool open + runs.jsonl scan all at once. Runs in a daemon
@@ -3332,8 +3742,9 @@ def create_app(state_file, event_bus=None, dashboard_port=5000):
         except Exception:
             pass
         try:
-            state = load_state()
-            folder = state.get("project_folder") or "/"
+            from fun_doc import get_state_meta
+
+            folder = get_state_meta().get("project_folder") or "/"
             _fetch_project_binaries(folder)
         except Exception:
             pass
